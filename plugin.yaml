@@ -1,6 +1,6 @@
 name: mcp-smart-routing
 version: 1.4.0
-manifest_version: 2
+manifest_version: 1
 api_version: 1
 description: Thin-Hook Interceptor, der MCP-Tool-Listen per FastEmbed-Vector-Search dynamisch filtriert.
 author: Marten Lucas
