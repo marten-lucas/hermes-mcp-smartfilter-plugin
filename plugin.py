@@ -2,7 +2,7 @@ import logging
 import os
 import requests
 
-logger = logging.getLogger("hermes.plugins.mcp_tool_selector")
+logger = logging.getLogger("hermes.plugins.mcp_smart_filter")
 
 
 def _extract_tool_info(tool: dict) -> dict:
@@ -20,9 +20,9 @@ def _extract_tool_info(tool: dict) -> dict:
 
 def register(ctx):
     """Offizieller Registrierungs-Einstiegspunkt laut Hermes Doku."""
-    SERVICE_URL = os.environ.get("SMART_ROUTING_SERVICE_URL", "").rstrip("/")
-    API_KEY = os.environ.get("SMART_ROUTING_API_KEY", "")
-    DEBUG_MODE = os.environ.get("SMART_ROUTING_DEBUG", "false").lower() in (
+    SERVICE_URL = os.environ.get("SMART_FILTER_SERVICE_URL", "").rstrip("/")
+    API_KEY = os.environ.get("SMART_FILTER_API_KEY", "")
+    DEBUG_MODE = os.environ.get("SMART_FILTER_DEBUG", "false").lower() in (
         "true",
         "1",
         "yes",
@@ -30,30 +30,33 @@ def register(ctx):
 
     if DEBUG_MODE:
         logger.setLevel(logging.DEBUG)
+        logger.debug("[Smart-Filter] Debug-Logging ist aktiviert.")
 
     try:
-        MAX_K = int(os.environ.get("SMART_ROUTING_MAX_K", "8"))
-        MIN_K = int(os.environ.get("SMART_ROUTING_MIN_K", "1"))
-        MIN_SCORE = float(os.environ.get("SMART_ROUTING_MIN_SCORE", "0.35"))
+        MAX_K = int(os.environ.get("SMART_FILTER_MAX_K", "8"))
+        MIN_K = int(os.environ.get("SMART_FILTER_MIN_K", "1"))
+        MIN_SCORE = float(os.environ.get("SMART_FILTER_MIN_SCORE", "0.35"))
         RELATIVE_THRESHOLD = float(
-            os.environ.get("SMART_ROUTING_RELATIVE_THRESHOLD", "0.75")
+            os.environ.get("SMART_FILTER_RELATIVE_THRESHOLD", "0.75")
         )
-        TIMEOUT = float(os.environ.get("SMART_ROUTING_TIMEOUT", "2.5"))
+        TIMEOUT = float(os.environ.get("SMART_FILTER_TIMEOUT", "2.5"))
     except ValueError as err:
         logger.warning(
-            f"[Tool-Selector] Ungültige Konfiguration: {err}. Nutze Defaults."
+            f"[Smart-Filter] Ungültiges Konfigurationsformat: {err}. Verwende Fallback-Defaults."
         )
         MAX_K, MIN_K, MIN_SCORE, RELATIVE_THRESHOLD, TIMEOUT = 8, 1, 0.35, 0.75, 2.5
 
     def filter_llm_request_middleware(request, session_id="", **kwargs):
-        """Middleware vom Kind 'llm_request' zum Abfangen und Ersetzen der Provider-Payload."""
+        """Middleware vom Kind 'llm_request' zum Filtern der Provider-Payload."""
         raw_tools = request.get("tools") or []
 
-        # Bei 5 oder weniger Tools ist keine Reduzierung notwendig
         if len(raw_tools) <= 5:
+            if DEBUG_MODE:
+                logger.debug(
+                    "[Smart-Filter] Filter übersprungen (Tool-Anzahl <= 5)."
+                )
             return None
 
-        # Letzte User-Nachricht als Prompt ermitteln
         user_prompt = ""
         for msg in reversed(request.get("messages", [])):
             if isinstance(msg, dict) and msg.get("role") == "user":
@@ -70,9 +73,12 @@ def register(ctx):
                 break
 
         if not user_prompt:
+            if DEBUG_MODE:
+                logger.debug(
+                    "[Smart-Filter] Filter übersprungen (Kein User-Prompt gefunden)."
+                )
             return None
 
-        # Reduzierte Nutzlast für die Serveranfrage (nur name & description)
         payload_tools = [_extract_tool_info(t) for t in raw_tools]
 
         payload = {
@@ -106,27 +112,29 @@ def register(ctx):
             if not selected_names:
                 return None
 
-            # Ursprüngliche Tool-Objekte (inkl. JSON-Schemas) anhand der Namen filtern
             reduced_tools = [
                 t for t in raw_tools if _extract_tool_info(t)["name"] in selected_names
             ]
 
             logger.info(
-                f"[Tool-Selector] Tools erfolgreich reduziert: {len(raw_tools)} -> {len(reduced_tools)} "
+                f"[Smart-Filter] Tools erfolgreich reduziert: {len(raw_tools)} -> {len(reduced_tools)} "
                 f"(Top-Score: {res_data.get('top_score', 'N/A')})"
             )
 
-            # Korrekter Rückgabe-Contract für Hermes llm_request Middleware
+            if DEBUG_MODE:
+                logger.debug(
+                    f"[Smart-Filter] Ausgewählte Tools: {', '.join(selected_names)}"
+                )
+
             updated_request = dict(request)
             updated_request["tools"] = reduced_tools
             return {"request": updated_request}
 
         except requests.exceptions.RequestException as err:
             logger.error(
-                f"[Tool-Selector] Service-Fehler ({err}). Fallback: Alle Tools freigegeben."
+                f"[Smart-Filter] Service-Fehler ({err}). Fallback: Alle Tools freigegeben."
             )
             return None
 
-    # Offizielle Hermes-Registrierung für Middleware
     ctx.register_middleware("llm_request", filter_llm_request_middleware)
-    logger.info("[Tool-Selector] Middleware 'llm_request' erfolgreich registriert.")
+    logger.info("[Smart-Filter] Middleware 'llm_request' erfolgreich registriert.")
