@@ -1,12 +1,32 @@
+import json
 import logging
 import os
 import requests
 
 logger = logging.getLogger("hermes.plugins.mcp_smart_filter")
 
+# Schema für das überschriebene tool_search
+TOOL_SEARCH_SCHEMA = {
+    "name": "tool_search",
+    "description": (
+        "Search for available tools by semantic query or keywords. "
+        "Use this when you need a tool for a specific task but its full schema is not yet visible."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Semantic search query or keywords describing what action you want to perform.",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
 
 def _extract_tool_info(tool: dict) -> dict:
-    """Extrahiert name und description sowohl aus Anthropic- als auch OpenAI-Schemas."""
+    """Extrahiert name und description unabhängig vom Schema."""
     if not isinstance(tool, dict):
         return {"name": "", "description": ""}
 
@@ -19,7 +39,7 @@ def _extract_tool_info(tool: dict) -> dict:
 
 
 def register(ctx):
-    """Offizieller Registrierungs-Einstiegspunkt laut Hermes Doku."""
+    """Offizielle Registrierung des überschriebenen tool_search Handlers."""
     SERVICE_URL = os.environ.get("SMART_FILTER_SERVICE_URL", "").rstrip("/")
     API_KEY = os.environ.get("SMART_FILTER_API_KEY", "")
     DEBUG_MODE = os.environ.get("SMART_FILTER_DEBUG", "false").lower() in (
@@ -30,70 +50,52 @@ def register(ctx):
 
     if DEBUG_MODE:
         logger.setLevel(logging.DEBUG)
-        logger.debug("[Smart-Filter] Debug-Logging ist aktiviert.")
 
     try:
         MAX_K = int(os.environ.get("SMART_FILTER_MAX_K", "8"))
         MIN_K = int(os.environ.get("SMART_FILTER_MIN_K", "1"))
-        MIN_SCORE = float(os.environ.get("SMART_FILTER_MIN_SCORE", "0.35"))
-        RELATIVE_THRESHOLD = float(
-            os.environ.get("SMART_FILTER_RELATIVE_THRESHOLD", "0.75")
-        )
+        MIN_SCORE = float(os.environ.get("SMART_FILTER_MIN_SCORE", "0.25"))
         TIMEOUT = float(os.environ.get("SMART_FILTER_TIMEOUT", "2.5"))
     except ValueError as err:
         logger.warning(
-            f"[Smart-Filter] Ungültiges Konfigurationsformat: {err}. Verwende Fallback-Defaults."
+            f"[Smart-Filter] Ungültige Konfiguration: {err}. Nutze Defaults."
         )
-        MAX_K, MIN_K, MIN_SCORE, RELATIVE_THRESHOLD, TIMEOUT = 8, 1, 0.35, 0.75, 2.5
+        MAX_K, MIN_K, MIN_SCORE, TIMEOUT = 8, 1, 0.25, 2.5
 
-    def filter_llm_request_middleware(request, session_id="", **kwargs):
-        """Middleware vom Kind 'llm_request' zum Filtern der Provider-Payload."""
-        raw_tools = request.get("tools") or []
+    def handle_semantic_tool_search(args: dict, **kwargs) -> str:
+        """Handler, der das interne BM25-Matching durch FastEmbed ersetzt."""
+        query = args.get("query") or args.get("queries") or ""
+        if isinstance(query, list):
+            query = " ".join(query)
 
-        if len(raw_tools) <= 5:
-            if DEBUG_MODE:
-                logger.debug(
-                    "[Smart-Filter] Filter übersprungen (Tool-Anzahl <= 5)."
-                )
-            return None
+        query_str = str(query).strip()
+        if not query_str:
+            return json.dumps({"tools": [], "count": 0, "error": "Empty query"})
 
-        user_prompt = ""
-        for msg in reversed(request.get("messages", [])):
-            if isinstance(msg, dict) and msg.get("role") == "user":
-                content = msg.get("content")
-                if isinstance(content, str):
-                    user_prompt = content
-                elif isinstance(content, list):
-                    text_parts = [
-                        p.get("text", "")
-                        for p in content
-                        if isinstance(p, dict) and p.get("type") == "text"
-                    ]
-                    user_prompt = " ".join(text_parts)
-                break
+        # Hole den vollständigen Werkzeugkatalog aus den übergebenen Kontexten
+        # (Hermes übergibt registrierte Tools in kwargs oder via Registry)
+        available_tools = kwargs.get("tools") or kwargs.get("available_tools") or []
 
-        if not user_prompt:
-            if DEBUG_MODE:
-                logger.debug(
-                    "[Smart-Filter] Filter übersprungen (Kein User-Prompt gefunden)."
-                )
-            return None
+        # Falls kwargs keine Liste liefert, hole alle registrierten MCP-Tools
+        if not available_tools and hasattr(ctx, "_manager"):
+            try:
+                available_tools = list(ctx._manager.get_tools().values())
+            except Exception:
+                available_tools = []
 
-        payload_tools = [_extract_tool_info(t) for t in raw_tools]
+        payload_tools = [_extract_tool_info(t) for t in available_tools]
 
         payload = {
-            "query": user_prompt,
+            "query": query_str,
             "tools": payload_tools,
             "max_k": MAX_K,
             "min_k": MIN_K,
             "min_score": MIN_SCORE,
-            "relative_threshold": RELATIVE_THRESHOLD,
         }
 
         headers = {
             "Content-Type": "application/json",
             "X-API-Key": API_KEY,
-            "X-Session-Id": str(session_id),
         }
 
         try:
@@ -106,35 +108,45 @@ def register(ctx):
             response.raise_for_status()
 
             res_data = response.json()
-            selected_candidates = res_data.get("tools", [])
-            selected_names = {t["name"] for t in selected_candidates if "name" in t}
-
-            if not selected_names:
-                return None
-
-            reduced_tools = [
-                t for t in raw_tools if _extract_tool_info(t)["name"] in selected_names
-            ]
+            matched_items = res_data.get("tools", [])
 
             logger.info(
-                f"[Smart-Filter] Tools erfolgreich reduziert: {len(raw_tools)} -> {len(reduced_tools)} "
+                f"[Smart-Filter Reranker] Query: '{query_str}' -> {len(matched_items)} Tools gefunden "
                 f"(Top-Score: {res_data.get('top_score', 'N/A')})"
             )
 
-            if DEBUG_MODE:
-                logger.debug(
-                    f"[Smart-Filter] Ausgewählte Tools: {', '.join(selected_names)}"
-                )
-
-            updated_request = dict(request)
-            updated_request["tools"] = reduced_tools
-            return {"request": updated_request}
+            # Rückgabe im vom Hermes tool_search erwarteten Format
+            result = {
+                "matched_tools": [t["name"] for t in matched_items if "name" in t],
+                "count": len(matched_items),
+                "top_score": res_data.get("top_score", 0.0),
+            }
+            return json.dumps(result)
 
         except requests.exceptions.RequestException as err:
             logger.error(
-                f"[Smart-Filter] Service-Fehler ({err}). Fallback: Alle Tools freigegeben."
+                f"[Smart-Filter Reranker] Service-Fehler: {err}. Nutze Fallback."
             )
-            return None
+            return json.dumps(
+                {
+                    "error": f"Semantic search unavailable: {err}",
+                    "matched_tools": [],
+                }
+            )
 
-    ctx.register_middleware("llm_request", filter_llm_request_middleware)
-    logger.info("[Smart-Filter] Middleware 'llm_request' erfolgreich registriert.")
+    # Überschreibe das eingebaute tool_search von Hermes
+    try:
+        ctx.register_tool(
+            name="tool_search",
+            toolset="mcp_smart_filter",
+            schema=TOOL_SEARCH_SCHEMA,
+            handler=handle_semantic_tool_search,
+            override=True,  # Überschreibt die Hermes-Core-Funktion
+        )
+        logger.info(
+            "[Smart-Filter] Eingebautes 'tool_search' erfolgreich mit Vektor-Reranker überschrieben."
+        )
+    except Exception as err:
+        logger.error(
+            f"[Smart-Filter] Fehler beim Überschreiben von tool_search: {err}"
+        )
