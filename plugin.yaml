@@ -1,15 +1,15 @@
-name: mcp-smart-filtering
-version: 1.6.0
+name: mcp-smart-filter
+version: 1.5.0
 manifest_version: 1
 api_version: 1
 description: Dynamic LLM request middleware that filters large MCP tool catalogs using semantic vector search.
 author: Marten Lucas
-homepage: https://github.com/marten-lucas/hermes-mcp-smartrouting-plugin
+homepage: https://github.com/marten-lucas/hermes-mcp-smartfilter-plugin
 license: MIT
-tags: [mcp, tool-selector, vector-search]
+tags: [mcp, tool-filter, vector-search]
 kind: general
 python_dependencies:
   - "requests>=2.0,<3"
 requires_env:
-  - SMART_ROUTING_SERVICE_URL
-  - SMART_ROUTING_API_KEY
+  - SMART_FILTER_SERVICE_URL
+  - SMART_FILTER_API_KEY
