@@ -85,9 +85,9 @@ hermes plugins enable mcp-smart-filter
 
 ## Configuration
 
-The plugin uses the following options, configured via export or inside `~/.hermes/config.yaml`:
+Available parameters for `~/.hermes/config.yaml` or application settings:
 
-| Option | Required | Default | Description |
+| Setting Name | Required | Default | Description |
 | :--- | :---: | :---: | :--- |
 | `SMART_FILTER_SERVICE_URL` | **Yes** | — | Base URL of your `hermes-mcp-smartfilter-service` |
 | `SMART_FILTER_API_KEY` | **Yes** | — | Secret API key for authenticating with the backend service |
@@ -100,7 +100,7 @@ The plugin uses the following options, configured via export or inside `~/.herme
 
 ---
 
-## Verification & Debugging
+## Verification & Diagnostics
 
 Verify plugin registration with the Hermes Plugin Doctor:
 
