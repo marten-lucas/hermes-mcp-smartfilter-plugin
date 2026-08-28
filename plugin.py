@@ -1,4 +1,3 @@
-```python
 import json
 import logging
 import os
@@ -299,4 +298,3 @@ def register(ctx):
     logger.info(
         "[Smart-Filter] Registered tool_search via register_tool()."
     )
-```
