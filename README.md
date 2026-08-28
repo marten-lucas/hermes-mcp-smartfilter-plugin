@@ -21,7 +21,7 @@ When running multiple MCP servers (e.g., via Coolify or Agent Gateway), exposing
                                       ▼
                         ┌──────────────────────────┐
                         │ llm_request Middleware   │
-                        │ (mcp-smartfilter-plugin) │
+                        │ (mcp-smart-filter)       │
                         └─────────────┬────────────┘
                                       │
                          Query + Slim Candidates (Names/Descs)
@@ -85,7 +85,7 @@ git clone [https://github.com/marten-lucas/hermes-mcp-smartfilter-plugin.git](ht
 Enable the plugin:
 
 ```bash
-hermes plugins enable mcp-smart-routing
+hermes plugins enable mcp-smart-filter
 ```
 
 ---
@@ -96,14 +96,14 @@ Set the required environment variables in your environment or `~/.hermes/config.
 
 | Environment Variable | Required | Default | Description |
 | :--- | :---: | :---: | :--- |
-| `SMART_ROUTING_SERVICE_URL` | **Yes** | — | Base URL of your `hermes-mcp-smartfilter-service` (e.g., `https://smartfilter.internal.domain`) |
-| `SMART_ROUTING_API_KEY` | **Yes** | — | API key for authenticating with the backend service |
-| `SMART_ROUTING_MAX_K` | No | `8` | Maximum number of top relevant tools to present to the LLM |
-| `SMART_ROUTING_MIN_K` | No | `1` | Minimum number of tools to guarantee when candidates match |
-| `SMART_ROUTING_MIN_SCORE` | No | `0.35` | Absolute minimum similarity score required for inclusion (0.0 to 1.0) |
-| `SMART_ROUTING_RELATIVE_THRESHOLD` | No | `0.75` | Relative threshold against the top-scoring tool (e.g., 0.75 means score $\ge 0.75 \times \text{top\_score}$) |
-| `SMART_ROUTING_TIMEOUT` | No | `2.5` | HTTP request timeout in seconds before failing open |
-| `SMART_ROUTING_DEBUG` | No | `false` | Set to `true` or `1` for detailed plugin logs |
+| `SMART_FILTER_SERVICE_URL` | **Yes** | — | Base URL of your `hermes-mcp-smartfilter-service` (e.g., `https://smartfilter.internal.domain`) |
+| `SMART_FILTER_API_KEY` | **Yes** | — | API key for authenticating with the backend service |
+| `SMART_FILTER_MAX_K` | No | `8` | Maximum number of top relevant tools to present to the LLM |
+| `SMART_FILTER_MIN_K` | No | `1` | Minimum number of tools to guarantee when candidates match |
+| `SMART_FILTER_MIN_SCORE` | No | `0.35` | Absolute minimum similarity score required for inclusion (0.0 to 1.0) |
+| `SMART_FILTER_RELATIVE_THRESHOLD` | No | `0.75` | Relative threshold against the top-scoring tool (e.g., 0.75 means score $\ge 0.75 \times \text{top\_score}$) |
+| `SMART_FILTER_TIMEOUT` | No | `2.5` | HTTP request timeout in seconds before failing open |
+| `SMART_FILTER_DEBUG` | No | `false` | Set to `true`, `1`, or `yes` for verbose debug logs |
 
 ---
 
@@ -124,7 +124,7 @@ Check active plugins during a session:
 To tail filtering logs:
 
 ```bash
-hermes logs --level DEBUG | grep "[Tool-Selector]"
+hermes logs --level DEBUG | grep "[Smart-Filter]"
 ```
 
 ---
