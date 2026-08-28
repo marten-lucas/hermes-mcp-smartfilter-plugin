@@ -1,15 +1,17 @@
 name: mcp-smart-filter
-version: 1.5.0
+version: 1.7.0
 manifest_version: 1
 api_version: 1
-description: Dynamic LLM request middleware that filters large MCP tool catalogs using semantic vector search.
+description: Replaces Hermes native BM25 tool_search with FastEmbed semantic vector search.
 author: Marten Lucas
 homepage: https://github.com/marten-lucas/hermes-mcp-smartfilter-plugin
 license: MIT
-tags: [mcp, tool-filter, vector-search]
+tags: [mcp, tool-filter, vector-search, reranker]
 kind: general
 python_dependencies:
   - "requests>=2.0,<3"
 requires_env:
   - SMART_FILTER_SERVICE_URL
   - SMART_FILTER_API_KEY
+capabilities:
+  - tools.override
