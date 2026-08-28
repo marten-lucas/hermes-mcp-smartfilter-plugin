@@ -62,72 +62,20 @@ When running multiple MCP servers (e.g., via Coolify or Agent Gateway), exposing
 
 ## Prerequisites
 
-- [Hermes Agent](https://github.com/NousResearch/hermes-agent) installed.
+- Hermes Agent installed.
 - A running instance of [hermes-mcp-smartfilter-service](https://github.com/marten-lucas/hermes-mcp-smartfilter-service).
 
 ---
 
 ## Installation
 
-Install the plugin into your Hermes environment using the CLI:
+Install the plugin using the Hermes CLI:
 
 ```bash
 hermes plugins install marten-lucas/hermes-mcp-smartfilter-plugin
 ```
 
-After installation, activate the plugin:
+Activate the plugin:
 
 ```bash
 hermes plugins enable mcp-smart-filter
-```
-
----
-
-## Configuration
-
-Available parameters for `~/.hermes/config.yaml` or application settings:
-
-| Setting Name | Required | Default | Description |
-| :--- | :---: | :---: | :--- |
-| `SMART_FILTER_SERVICE_URL` | **Yes** | — | Base URL of your `hermes-mcp-smartfilter-service` |
-| `SMART_FILTER_API_KEY` | **Yes** | — | Secret API key for authenticating with the backend service |
-| `SMART_FILTER_MAX_K` | No | `8` | Maximum number of top relevant tools to present to the LLM |
-| `SMART_FILTER_MIN_K` | No | `1` | Minimum number of tools to guarantee when candidates match |
-| `SMART_FILTER_MIN_SCORE` | No | `0.35` | Absolute minimum similarity score required for inclusion (0.0 to 1.0) |
-| `SMART_FILTER_RELATIVE_THRESHOLD` | No | `0.75` | Relative threshold against top score (score $\ge 0.75 \times \text{top\_score}$) |
-| `SMART_FILTER_TIMEOUT` | No | `2.5` | HTTP request timeout in seconds before failing open |
-| `SMART_FILTER_DEBUG` | No | `false` | Enable verbose log output (`true`, `1`, `yes`) |
-
----
-
-## Verification & Diagnostics
-
-Verify plugin registration with the Hermes Plugin Doctor:
-
-```bash
-hermes plugins doctor ~/.hermes/plugins/mcp-smart-filter --ci
-```
-
-Check active plugins during an agent session:
-
-```bash
-/plugins
-```
-
-To tail filtering logs in real time:
-
-```bash
-hermes logs --level DEBUG | grep "[Smart-Filter]"
-```
-
----
-
-## Companion Repository
-
-- **Service:** [hermes-mcp-smartfilter-service](https://github.com/marten-lucas/hermes-mcp-smartfilter-service) — FastEmbed + NumPy embedding backend service.
-
----
-
-## License
-
-[MIT](LICENSE)
