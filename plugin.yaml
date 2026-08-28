@@ -1,12 +1,12 @@
 name: mcp-smart-routing
-version: 1.4.0
+version: 1.6.0
 manifest_version: 1
 api_version: 1
-description: Thin-Hook Interceptor, der MCP-Tool-Listen per FastEmbed-Vector-Search dynamisch filtriert.
+description: Dynamic LLM request middleware that filters large MCP tool catalogs using semantic vector search.
 author: Marten Lucas
-homepage: https://github.com/marten-lucas/hermes-mcp-smartrouting
+homepage: https://github.com/marten-lucas/hermes-mcp-smartrouting-plugin
 license: MIT
-tags: [mcp, tool-routing, vector-search]
+tags: [mcp, tool-selector, vector-search]
 kind: general
 python_dependencies:
   - "requests>=2.0,<3"
