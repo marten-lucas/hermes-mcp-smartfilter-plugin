@@ -1,105 +1,132 @@
 import logging
+import os
 import requests
 
-logger = logging.getLogger("hermes.plugins.mcp_tool_reducer")
+logger = logging.getLogger("hermes.plugins.mcp_tool_selector")
+
+
+def _extract_tool_info(tool: dict) -> dict:
+    """Extrahiert name und description sowohl aus Anthropic- als auch OpenAI-Schemas."""
+    if not isinstance(tool, dict):
+        return {"name": "", "description": ""}
+
+    fn = tool.get("function") if isinstance(tool.get("function"), dict) else None
+    src = fn or tool
+    return {
+        "name": str(src.get("name", "")),
+        "description": str(src.get("description", "")),
+    }
 
 
 def register(ctx):
-    """Eintrittspunkt für das Hermes Agent Plugin System."""
-    # 1. Basis-Endpunkt, Auth & Debug-Modus
-    SEARCH_SERVICE_URL = ctx.env.get("SMART_ROUTING_SERVICE_URL", "")
-    API_KEY = ctx.env.get("SMART_ROUTING_API_KEY", "")
-
-    # Debug Flag (true, 1, yes)
-    DEBUG_MODE = (
-        ctx.env.get("SMART_ROUTING_DEBUG", "false").lower() in ("true", "1", "yes")
+    """Offizieller Registrierungs-Einstiegspunkt laut Hermes Doku."""
+    SERVICE_URL = os.environ.get("SMART_ROUTING_SERVICE_URL", "").rstrip("/")
+    API_KEY = os.environ.get("SMART_ROUTING_API_KEY", "")
+    DEBUG_MODE = os.environ.get("SMART_ROUTING_DEBUG", "false").lower() in (
+        "true",
+        "1",
+        "yes",
     )
 
     if DEBUG_MODE:
         logger.setLevel(logging.DEBUG)
-        logger.debug("[Smart-Routing] Debug-Logging ist aktiviert.")
 
-    # 2. Dynamische Schwellenwerte aus der Hermes-Umgebung laden
     try:
-        MAX_K = int(ctx.env.get("SMART_ROUTING_MAX_K", "8"))
-        MIN_SCORE = float(ctx.env.get("SMART_ROUTING_MIN_SCORE", "0.35"))
-        RELATIVE_THRESHOLD = float(ctx.env.get("SMART_ROUTING_RELATIVE_THRESHOLD", "0.75"))
+        MAX_K = int(os.environ.get("SMART_ROUTING_MAX_K", "8"))
+        MIN_K = int(os.environ.get("SMART_ROUTING_MIN_K", "1"))
+        MIN_SCORE = float(os.environ.get("SMART_ROUTING_MIN_SCORE", "0.35"))
+        RELATIVE_THRESHOLD = float(
+            os.environ.get("SMART_ROUTING_RELATIVE_THRESHOLD", "0.75")
+        )
+        TIMEOUT = float(os.environ.get("SMART_ROUTING_TIMEOUT", "2.5"))
     except ValueError as err:
         logger.warning(
-            f"[Smart-Routing] Ungültiger Konfigurationswert für Filter-Parameter: {err}. "
-            "Verwende Fallback-Defaults (max_k=8, min_score=0.35, relative_threshold=0.75)."
+            f"[Tool-Selector] Ungültige Konfiguration: {err}. Nutze Defaults."
         )
-        MAX_K = 8
-        MIN_SCORE = 0.35
-        RELATIVE_THRESHOLD = 0.75
+        MAX_K, MIN_K, MIN_SCORE, RELATIVE_THRESHOLD, TIMEOUT = 8, 1, 0.35, 0.75, 2.5
 
-    @ctx.on("on_tools_load")
-    def filter_mcp_tools(**event):
-        """Lifecycle Interceptor Hook."""
-        raw_tools = event.get("tools", [])
-        user_prompt = event.get("user_prompt", "")
+    def filter_llm_request_middleware(request, session_id="", **kwargs):
+        """Middleware vom Kind 'llm_request' zum Abfangen und Ersetzen der Provider-Payload."""
+        raw_tools = request.get("tools") or []
 
-        user_id = ctx.session.get("user_id") or ctx.env.get(
-            "X_ON_BEHALF_OF", "default_user"
-        )
+        # Bei 5 oder weniger Tools ist keine Reduzierung notwendig
+        if len(raw_tools) <= 5:
+            return None
 
-        if DEBUG_MODE:
-            logger.debug(
-                f"[Smart-Routing] Prompt empfangen für User '{user_id}': \"{user_prompt}\" "
-                f"({len(raw_tools)} Tools geladen)."
-            )
+        # Letzte User-Nachricht als Prompt ermitteln
+        user_prompt = ""
+        for msg in reversed(request.get("messages", [])):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                content = msg.get("content")
+                if isinstance(content, str):
+                    user_prompt = content
+                elif isinstance(content, list):
+                    text_parts = [
+                        p.get("text", "")
+                        for p in content
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    ]
+                    user_prompt = " ".join(text_parts)
+                break
 
-        if len(raw_tools) <= 5 or not user_prompt:
-            if DEBUG_MODE:
-                logger.debug(
-                    "[Smart-Routing] Filter übersprungen (Tool-Anzahl <= 5 oder Prompt leer)."
-                )
-            return
+        if not user_prompt:
+            return None
+
+        # Reduzierte Nutzlast für die Serveranfrage (nur name & description)
+        payload_tools = [_extract_tool_info(t) for t in raw_tools]
+
+        payload = {
+            "query": user_prompt,
+            "tools": payload_tools,
+            "max_k": MAX_K,
+            "min_k": MIN_K,
+            "min_score": MIN_SCORE,
+            "relative_threshold": RELATIVE_THRESHOLD,
+        }
 
         headers = {
             "Content-Type": "application/json",
             "X-API-Key": API_KEY,
-            "X-On-Behalf-Of": user_id,
-        }
-
-        payload = {
-            "query": user_prompt,
-            "max_k": MAX_K,
-            "min_score": MIN_SCORE,
-            "relative_threshold": RELATIVE_THRESHOLD,
-            "tools": raw_tools,
+            "X-Session-Id": str(session_id),
         }
 
         try:
             response = requests.post(
-                f"{SEARCH_SERVICE_URL}/filter",
+                f"{SERVICE_URL}/filter",
                 json=payload,
                 headers=headers,
-                timeout=2.5,
+                timeout=TIMEOUT,
             )
             response.raise_for_status()
 
-            filtered_result = response.json()
-            reduced_tools = filtered_result.get("tools", [])
+            res_data = response.json()
+            selected_candidates = res_data.get("tools", [])
+            selected_names = {t["name"] for t in selected_candidates if "name" in t}
 
-            if reduced_tools:
-                top_score = filtered_result.get("top_score", "N/A")
-                logger.info(
-                    f"[Smart-Routing] Tools für User '{user_id}' erfolgreich von "
-                    f"{len(raw_tools)} auf {len(reduced_tools)} reduziert "
-                    f"(Top-Score: {top_score})."
-                )
+            if not selected_names:
+                return None
 
-                if DEBUG_MODE:
-                    tool_names = [t.get("name") for t in reduced_tools]
-                    logger.debug(
-                        f"[Smart-Routing] Ausgewählte Tools: {', '.join(tool_names)}"
-                    )
+            # Ursprüngliche Tool-Objekte (inkl. JSON-Schemas) anhand der Namen filtern
+            reduced_tools = [
+                t for t in raw_tools if _extract_tool_info(t)["name"] in selected_names
+            ]
 
-                event["tools"] = reduced_tools
+            logger.info(
+                f"[Tool-Selector] Tools erfolgreich reduziert: {len(raw_tools)} -> {len(reduced_tools)} "
+                f"(Top-Score: {res_data.get('top_score', 'N/A')})"
+            )
+
+            # Korrekter Rückgabe-Contract für Hermes llm_request Middleware
+            updated_request = dict(request)
+            updated_request["tools"] = reduced_tools
+            return {"request": updated_request}
 
         except requests.exceptions.RequestException as err:
             logger.error(
-                f"[Smart-Routing] Fehler beim Aufruf des Search-Services: {err}. "
-                "Verwende vollständige Tool-Liste als Fallback."
+                f"[Tool-Selector] Service-Fehler ({err}). Fallback: Alle Tools freigegeben."
             )
+            return None
+
+    # Offizielle Hermes-Registrierung für Middleware
+    ctx.register_middleware("llm_request", filter_llm_request_middleware)
+    logger.info("[Tool-Selector] Middleware 'llm_request' erfolgreich registriert.")
