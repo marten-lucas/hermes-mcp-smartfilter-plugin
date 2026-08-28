@@ -1,23 +1,30 @@
+```python
 import json
 import logging
 import os
+
 import requests
+
 
 logger = logging.getLogger("hermes.plugins.mcp_smart_filter")
 
-# Schema für das überschriebene tool_search
+
 TOOL_SEARCH_SCHEMA = {
     "name": "tool_search",
     "description": (
         "Search for available tools by semantic query or keywords. "
-        "Use this when you need a tool for a specific task but its full schema is not yet visible."
+        "Use this when you need a tool for a specific task but its full schema "
+        "is not yet visible."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Semantic search query or keywords describing what action you want to perform.",
+                "description": (
+                    "Semantic search query or keywords describing what action "
+                    "you want to perform."
+                ),
             },
         },
         "required": ["query"],
@@ -25,281 +32,271 @@ TOOL_SEARCH_SCHEMA = {
 }
 
 
-def _extract_tool_info(tool: dict) -> dict:
-    """Extrahiert Name und Beschreibung eines Tools unabhängig von der Struktur."""
+def _extract_tool_info(tool):
+    """Extract name and description from different Hermes tool formats."""
     if not isinstance(tool, dict):
         return {"name": "", "description": ""}
 
-    fn = tool.get("function") if isinstance(tool.get("function"), dict) else None
-    src = fn or tool
+    function = tool.get("function")
+    source = function if isinstance(function, dict) else tool
+
     return {
-        "name": str(src.get("name", "")),
-        "description": str(src.get("description", "")),
+        "name": str(source.get("name", "")),
+        "description": str(source.get("description", "")),
     }
 
 
-def register(ctx):
-    """Offizielle Registrierung des überschriebenen tool_search Handlers."""
-    SERVICE_URL = os.environ.get("SMART_FILTER_SERVICE_URL", "").rstrip("/")
-    API_KEY = os.environ.get("SMART_FILTER_API_KEY", "")
-    DEBUG_MODE = os.environ.get("SMART_FILTER_DEBUG", "false").lower() in (
-        "true",
-        "1",
-        "yes",
+def _get_available_tools(ctx, kwargs):
+    """Try to obtain the current Hermes tool catalogue."""
+    tools = (
+        kwargs.get("tools")
+        or kwargs.get("available_tools")
+        or []
     )
 
-    if DEBUG_MODE:
+    if tools:
+        return list(tools)
+
+    manager = getattr(ctx, "_manager", None)
+    if manager is not None:
+        get_tools = getattr(manager, "get_tools", None)
+        if callable(get_tools):
+            try:
+                result = get_tools()
+                if isinstance(result, dict):
+                    return list(result.values())
+                return list(result or [])
+            except Exception:
+                logger.exception(
+                    "[Smart-Filter] Failed to read tools from ctx._manager"
+                )
+
+    get_tools = getattr(ctx, "get_tools", None)
+    if callable(get_tools):
+        try:
+            result = get_tools()
+            if isinstance(result, dict):
+                return list(result.values())
+            return list(result or [])
+        except Exception:
+            logger.exception(
+                "[Smart-Filter] Failed to read tools from plugin context"
+            )
+
+    return []
+
+
+def register(ctx):
+    """Register the semantic tool_search override."""
+
+    service_url = os.environ.get(
+        "SMART_FILTER_SERVICE_URL",
+        "",
+    ).rstrip("/")
+
+    api_key = os.environ.get(
+        "SMART_FILTER_API_KEY",
+        "",
+    )
+
+    debug_mode = os.environ.get(
+        "SMART_FILTER_DEBUG",
+        "false",
+    ).lower() in {"true", "1", "yes", "on"}
+
+    if debug_mode:
         logger.setLevel(logging.DEBUG)
 
     try:
-        MAX_K = int(os.environ.get("SMART_FILTER_MAX_K", "8"))
-        MIN_K = int(os.environ.get("SMART_FILTER_MIN_K", "1"))
-        MIN_SCORE = float(os.environ.get("SMART_FILTER_MIN_SCORE", "0.25"))
-        TIMEOUT = float(os.environ.get("SMART_FILTER_TIMEOUT", "2.5"))
-    except ValueError as err:
-        logger.warning(
-            f"[Smart-Filter] Ungültige Konfiguration: {err}. Nutze Defaults."
+        max_k = int(os.environ.get("SMART_FILTER_MAX_K", "8"))
+        min_k = int(os.environ.get("SMART_FILTER_MIN_K", "1"))
+        min_score = float(
+            os.environ.get("SMART_FILTER_MIN_SCORE", "0.25")
         )
-        MAX_K, MIN_K, MIN_SCORE, TIMEOUT = 8, 1, 0.25, 2.5
+        timeout = float(
+            os.environ.get("SMART_FILTER_TIMEOUT", "2.5")
+        )
+    except ValueError as exc:
+        logger.warning(
+            "[Smart-Filter] Invalid configuration: %s. "
+            "Using defaults.",
+            exc,
+        )
+        max_k = 8
+        min_k = 1
+        min_score = 0.25
+        timeout = 2.5
 
-    def handle_semantic_tool_search(args: dict, **kwargs) -> str:
-        """Handler, der das interne BM25-Matching durch FastEmbed ersetzt."""
-        query = args.get("query") or args.get("queries") or ""
+    if not service_url:
+        logger.warning(
+            "[Smart-Filter] SMART_FILTER_SERVICE_URL is not configured."
+        )
+
+    def handle_semantic_tool_search(args=None, **kwargs):
+        """Use the external FastEmbed service for semantic tool search."""
+
+        args = args or {}
+
+        query = (
+            args.get("query")
+            or args.get("queries")
+            or ""
+        )
+
         if isinstance(query, list):
-            query = " ".join(query)
+            query = " ".join(str(item) for item in query)
 
         query_str = str(query).strip()
+
         if not query_str:
-            return json.dumps({"matched_tools": [], "count": 0, "error": "Empty query"})
+            return json.dumps(
+                {
+                    "matched_tools": [],
+                    "count": 0,
+                    "error": "Empty query",
+                }
+            )
 
-        # Werkzeugkatalog aus kwargs oder Hermes-Registry auslesen
-        available_tools = kwargs.get("tools") or kwargs.get("available_tools") or []
+        available_tools = _get_available_tools(ctx, kwargs)
 
-        if not available_tools:
-            if hasattr(ctx, "_manager") and hasattr(ctx._manager, "get_tools"):
-                try:
-                    available_tools = list(ctx._manager.get_tools().values())
-                except Exception:
-                    available_tools = []
-            elif hasattr(ctx, "get_tools"):
-                try:
-                    available_tools = list(ctx.get_tools().values())
-                except Exception:
-                    available_tools = []
-
-        payload_tools = [_extract_tool_info(t) for t in available_tools]
+        payload_tools = [
+            tool
+            for tool in (
+                _extract_tool_info(item)
+                for item in available_tools
+            )
+            if tool["name"]
+        ]
 
         payload = {
             "query": query_str,
             "tools": payload_tools,
-            "max_k": MAX_K,
-            "min_k": MIN_K,
-            "min_score": MIN_SCORE,
+            "max_k": max_k,
+            "min_k": min_k,
+            "min_score": min_score,
         }
 
         headers = {
             "Content-Type": "application/json",
-            "X-API-Key": API_KEY,
         }
 
-        try:
-            response = requests.post(
-                f"{SERVICE_URL}/filter",
-                json=payload,
-                headers=headers,
-                timeout=TIMEOUT,
-            )
-            response.raise_for_status()
+        if api_key:
+            headers["X-API-Key"] = api_key
 
-            res_data = response.json()
-            matched_items = res_data.get("tools", [])
-
-            logger.info(
-                f"[Smart-Filter Reranker] Query: '{query_str}' -> {len(matched_items)} Tools via FastEmbed gefunden "
-                f"(Top-Score: {res_data.get('top_score', 'N/A')})"
-            )
-
-            result = {
-                "matched_tools": [t["name"] for t in matched_items if "name" in t],
-                "count": len(matched_items),
-                "top_score": res_data.get("top_score", 0.0),
-            }
-            return json.dumps(result)
-
-        except requests.exceptions.RequestException as err:
-            logger.error(
-                f"[Smart-Filter Reranker] Service-Fehler ({err}). Gebe Fallback zurück."
-            )
+        if not service_url:
             return json.dumps(
                 {
-                    "error": f"Semantic search unavailable: {err}",
                     "matched_tools": [],
+                    "count": 0,
+                    "error": (
+                        "SMART_FILTER_SERVICE_URL is not configured"
+                    ),
                 }
             )
 
-    # Sauberes Registrieren/Überschreiben für Hermes Doctor & Runtime
-    if hasattr(ctx, "register_tool_override"):
-        ctx.register_tool_override("tool_search", handle_semantic_tool_search)
-    else:
-        ctx.register_tool(
-            name="tool_search",
-            schema=TOOL_SEARCH_SCHEMA,
-            handler=handle_semantic_tool_search,
-            override=True,
-        )
+        try:
+            response = requests.post(
+                f"{service_url}/filter",
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+            )
 
-    logger.info("[Smart-Filter] Vektor-Reranker erfolgreich registriert.")import json
-import logging
-import os
-import requests
+            response.raise_for_status()
+            response_data = response.json()
 
-logger = logging.getLogger("hermes.plugins.mcp_smart_filter")
+            matched_items = response_data.get("tools", [])
 
-# Schema für das überschriebene tool_search
-TOOL_SEARCH_SCHEMA = {
-    "name": "tool_search",
-    "description": (
-        "Search for available tools by semantic query or keywords. "
-        "Use this when you need a tool for a specific task but its full schema is not yet visible."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "Semantic search query or keywords describing what action you want to perform.",
-            },
-        },
-        "required": ["query"],
-    },
-}
+            matched_names = [
+                item["name"]
+                for item in matched_items
+                if isinstance(item, dict) and item.get("name")
+            ]
 
+            logger.info(
+                "[Smart-Filter] Query=%r -> %d tools "
+                "(top_score=%s)",
+                query_str,
+                len(matched_names),
+                response_data.get("top_score", "N/A"),
+            )
 
-def _extract_tool_info(tool: dict) -> dict:
-    """Extrahiert name und description unabhängig vom Schema."""
-    if not isinstance(tool, dict):
-        return {"name": "", "description": ""}
+            return json.dumps(
+                {
+                    "matched_tools": matched_names,
+                    "count": len(matched_names),
+                    "top_score": response_data.get(
+                        "top_score",
+                        0.0,
+                    ),
+                }
+            )
 
-    fn = tool.get("function") if isinstance(tool.get("function"), dict) else None
-    src = fn or tool
-    return {
-        "name": str(src.get("name", "")),
-        "description": str(src.get("description", "")),
-    }
+        except requests.exceptions.RequestException as exc:
+            logger.error(
+                "[Smart-Filter] Service error: %s",
+                exc,
+            )
 
+            return json.dumps(
+                {
+                    "error": f"Semantic search unavailable: {exc}",
+                    "matched_tools": [],
+                    "count": 0,
+                }
+            )
 
-def register(ctx):
-    """Offizielle Registrierung des überschriebenen tool_search Handlers."""
-    SERVICE_URL = os.environ.get("SMART_FILTER_SERVICE_URL", "").rstrip("/")
-    API_KEY = os.environ.get("SMART_FILTER_API_KEY", "")
-    DEBUG_MODE = os.environ.get("SMART_FILTER_DEBUG", "false").lower() in (
-        "true",
-        "1",
-        "yes",
+        except (ValueError, TypeError) as exc:
+            logger.error(
+                "[Smart-Filter] Invalid response from service: %s",
+                exc,
+            )
+
+            return json.dumps(
+                {
+                    "error": f"Invalid semantic search response: {exc}",
+                    "matched_tools": [],
+                    "count": 0,
+                }
+            )
+
+    # Prefer the dedicated override API when available.
+    register_override = getattr(
+        ctx,
+        "register_tool_override",
+        None,
     )
 
-    if DEBUG_MODE:
-        logger.setLevel(logging.DEBUG)
-
-    try:
-        MAX_K = int(os.environ.get("SMART_FILTER_MAX_K", "8"))
-        MIN_K = int(os.environ.get("SMART_FILTER_MIN_K", "1"))
-        MIN_SCORE = float(os.environ.get("SMART_FILTER_MIN_SCORE", "0.25"))
-        TIMEOUT = float(os.environ.get("SMART_FILTER_TIMEOUT", "2.5"))
-    except ValueError as err:
-        logger.warning(
-            f"[Smart-Filter] Ungültige Konfiguration: {err}. Nutze Defaults."
+    if callable(register_override):
+        register_override(
+            "tool_search",
+            handle_semantic_tool_search,
         )
-        MAX_K, MIN_K, MIN_SCORE, TIMEOUT = 8, 1, 0.25, 2.5
 
-    def handle_semantic_tool_search(args: dict, **kwargs) -> str:
-        """Handler, der das interne BM25-Matching durch FastEmbed ersetzt."""
-        query = args.get("query") or args.get("queries") or ""
-        if isinstance(query, list):
-            query = " ".join(query)
-
-        query_str = str(query).strip()
-        if not query_str:
-            return json.dumps({"tools": [], "count": 0, "error": "Empty query"})
-
-        # Hole verfügbare Werkzeuge aus kwargs
-        available_tools = kwargs.get("tools") or kwargs.get("available_tools") or []
-
-        # Fallback auf den Hermes-Tool-Manager (ctx._manager oder ctx.get_tools)
-        if not available_tools:
-            if hasattr(ctx, "_manager") and hasattr(ctx._manager, "get_tools"):
-                try:
-                    available_tools = list(ctx._manager.get_tools().values())
-                except Exception:
-                    available_tools = []
-            elif hasattr(ctx, "get_tools"):
-                try:
-                    available_tools = list(ctx.get_tools().values())
-                except Exception:
-                    available_tools = []
-
-        payload_tools = [_extract_tool_info(t) for t in available_tools]
-
-        payload = {
-            "query": query_str,
-            "tools": payload_tools,
-            "max_k": MAX_K,
-            "min_k": MIN_K,
-            "min_score": MIN_SCORE,
-        }
-
-        headers = {
-            "Content-Type": "application/json",
-            "X-API-Key": API_KEY,
-        }
-
-        try:
-            response = requests.post(
-                f"{SERVICE_URL}/filter",
-                json=payload,
-                headers=headers,
-                timeout=TIMEOUT,
-            )
-            response.raise_for_status()
-
-            res_data = response.json()
-            matched_items = res_data.get("tools", [])
-
-            logger.info(
-                f"[Smart-Filter Reranker] Query: '{query_str}' -> {len(matched_items)} Tools gefunden "
-                f"(Top-Score: {res_data.get('top_score', 'N/A')})"
-            )
-
-            result = {
-                "matched_tools": [t["name"] for t in matched_items if "name" in t],
-                "count": len(matched_items),
-                "top_score": res_data.get("top_score", 0.0),
-            }
-            return json.dumps(result)
-
-        except requests.exceptions.RequestException as err:
-            logger.error(
-                f"[Smart-Filter Reranker] Service-Fehler: {err}. Nutze Fallback."
-            )
-            return json.dumps(
-                {
-                    "error": f"Semantic search unavailable: {err}",
-                    "matched_tools": [],
-                }
-            )
-
-    # Überschreibe das eingebaute tool_search von Hermes
-    try:
-        ctx.register_tool(
-            name="tool_search",
-            schema=TOOL_SEARCH_SCHEMA,
-            handler=handle_semantic_tool_search,
-            override=True,
-        )
         logger.info(
-            "[Smart-Filter] Eingebautes 'tool_search' erfolgreich mit Vektor-Reranker überschrieben."
+            "[Smart-Filter] Registered tool_search via "
+            "register_tool_override()."
         )
-    except Exception as err:
-        logger.error(
-            f"[Smart-Filter] Fehler beim Überschreiben von tool_search: {err}"
+        return
+
+    # Compatibility fallback for Hermes versions that expose
+    # register_tool() instead.
+    register_tool = getattr(ctx, "register_tool", None)
+
+    if not callable(register_tool):
+        raise RuntimeError(
+            "Hermes PluginContext provides neither "
+            "register_tool_override() nor register_tool()."
         )
+
+    register_tool(
+        name="tool_search",
+        schema=TOOL_SEARCH_SCHEMA,
+        handler=handle_semantic_tool_search,
+        override=True,
+    )
+
+    logger.info(
+        "[Smart-Filter] Registered tool_search via register_tool()."
+    )
+```
