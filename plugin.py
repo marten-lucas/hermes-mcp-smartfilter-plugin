@@ -72,16 +72,21 @@ def register(ctx):
         if not query_str:
             return json.dumps({"tools": [], "count": 0, "error": "Empty query"})
 
-        # Hole den vollständigen Werkzeugkatalog aus den übergebenen Kontexten
-        # (Hermes übergibt registrierte Tools in kwargs oder via Registry)
+        # Hole verfügbare Werkzeuge aus kwargs
         available_tools = kwargs.get("tools") or kwargs.get("available_tools") or []
 
-        # Falls kwargs keine Liste liefert, hole alle registrierten MCP-Tools
-        if not available_tools and hasattr(ctx, "_manager"):
-            try:
-                available_tools = list(ctx._manager.get_tools().values())
-            except Exception:
-                available_tools = []
+        # Fallback auf den Hermes-Tool-Manager (ctx._manager oder ctx.get_tools)
+        if not available_tools:
+            if hasattr(ctx, "_manager") and hasattr(ctx._manager, "get_tools"):
+                try:
+                    available_tools = list(ctx._manager.get_tools().values())
+                except Exception:
+                    available_tools = []
+            elif hasattr(ctx, "get_tools"):
+                try:
+                    available_tools = list(ctx.get_tools().values())
+                except Exception:
+                    available_tools = []
 
         payload_tools = [_extract_tool_info(t) for t in available_tools]
 
@@ -115,7 +120,6 @@ def register(ctx):
                 f"(Top-Score: {res_data.get('top_score', 'N/A')})"
             )
 
-            # Rückgabe im vom Hermes tool_search erwarteten Format
             result = {
                 "matched_tools": [t["name"] for t in matched_items if "name" in t],
                 "count": len(matched_items),
@@ -138,10 +142,9 @@ def register(ctx):
     try:
         ctx.register_tool(
             name="tool_search",
-            toolset="mcp_smart_filter",
             schema=TOOL_SEARCH_SCHEMA,
             handler=handle_semantic_tool_search,
-            override=True,  # Überschreibt die Hermes-Core-Funktion
+            override=True,
         )
         logger.info(
             "[Smart-Filter] Eingebautes 'tool_search' erfolgreich mit Vektor-Reranker überschrieben."
