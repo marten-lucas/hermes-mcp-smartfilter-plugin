@@ -32,12 +32,19 @@ TOOL_SEARCH_SCHEMA = {
 
 
 def _extract_tool_info(tool):
-    """Extract name and description from different Hermes tool formats."""
+    """Extract name and description from a Hermes tool definition."""
     if not isinstance(tool, dict):
-        return {"name": "", "description": ""}
+        return {
+            "name": "",
+            "description": "",
+        }
 
     function = tool.get("function")
-    source = function if isinstance(function, dict) else tool
+
+    if isinstance(function, dict):
+        source = function
+    else:
+        source = tool
 
     return {
         "name": str(source.get("name", "")),
@@ -46,47 +53,68 @@ def _extract_tool_info(tool):
 
 
 def _get_available_tools(ctx, kwargs):
-    """Try to obtain the current Hermes tool catalogue."""
-    tools = (
-        kwargs.get("tools")
-        or kwargs.get("available_tools")
-        or []
-    )
+    """
+    Try to obtain the current Hermes tool catalogue.
+
+    Different Hermes versions expose this differently, so keep the
+    lookup defensive.
+    """
+
+    # Some Hermes call paths may provide the tools directly.
+    tools = kwargs.get("tools")
 
     if tools:
         return list(tools)
 
+    tools = kwargs.get("available_tools")
+
+    if tools:
+        return list(tools)
+
+    # Try PluginContext's manager.
     manager = getattr(ctx, "_manager", None)
+
     if manager is not None:
         get_tools = getattr(manager, "get_tools", None)
+
         if callable(get_tools):
             try:
                 result = get_tools()
+
                 if isinstance(result, dict):
                     return list(result.values())
+
                 return list(result or [])
+
             except Exception:
                 logger.exception(
-                    "[Smart-Filter] Failed to read tools from ctx._manager"
+                    "[Smart-Filter] Failed to read tools "
+                    "from ctx._manager"
                 )
 
+    # Try a public get_tools() method.
     get_tools = getattr(ctx, "get_tools", None)
+
     if callable(get_tools):
         try:
             result = get_tools()
+
             if isinstance(result, dict):
                 return list(result.values())
+
             return list(result or [])
+
         except Exception:
             logger.exception(
-                "[Smart-Filter] Failed to read tools from plugin context"
+                "[Smart-Filter] Failed to read tools "
+                "from plugin context"
             )
 
     return []
 
 
 def register(ctx):
-    """Register the semantic tool_search override."""
+    """Register the Smart Filter tool_search override."""
 
     service_url = os.environ.get(
         "SMART_FILTER_SERVICE_URL",
@@ -101,26 +129,52 @@ def register(ctx):
     debug_mode = os.environ.get(
         "SMART_FILTER_DEBUG",
         "false",
-    ).lower() in {"true", "1", "yes", "on"}
+    ).lower() in {
+        "true",
+        "1",
+        "yes",
+        "on",
+    }
 
     if debug_mode:
         logger.setLevel(logging.DEBUG)
 
     try:
-        max_k = int(os.environ.get("SMART_FILTER_MAX_K", "8"))
-        min_k = int(os.environ.get("SMART_FILTER_MIN_K", "1"))
+        max_k = int(
+            os.environ.get(
+                "SMART_FILTER_MAX_K",
+                "8",
+            )
+        )
+
+        min_k = int(
+            os.environ.get(
+                "SMART_FILTER_MIN_K",
+                "1",
+            )
+        )
+
         min_score = float(
-            os.environ.get("SMART_FILTER_MIN_SCORE", "0.25")
+            os.environ.get(
+                "SMART_FILTER_MIN_SCORE",
+                "0.25",
+            )
         )
+
         timeout = float(
-            os.environ.get("SMART_FILTER_TIMEOUT", "2.5")
+            os.environ.get(
+                "SMART_FILTER_TIMEOUT",
+                "2.5",
+            )
         )
+
     except ValueError as exc:
         logger.warning(
             "[Smart-Filter] Invalid configuration: %s. "
             "Using defaults.",
             exc,
         )
+
         max_k = 8
         min_k = 1
         min_score = 0.25
@@ -128,11 +182,17 @@ def register(ctx):
 
     if not service_url:
         logger.warning(
-            "[Smart-Filter] SMART_FILTER_SERVICE_URL is not configured."
+            "[Smart-Filter] SMART_FILTER_SERVICE_URL "
+            "is not configured."
         )
 
     def handle_semantic_tool_search(args=None, **kwargs):
-        """Use the external FastEmbed service for semantic tool search."""
+        """
+        Handle tool_search requests.
+
+        Hermes handlers receive the tool-call arguments as the first
+        positional argument and may receive additional context via kwargs.
+        """
 
         args = args or {}
 
@@ -143,7 +203,10 @@ def register(ctx):
         )
 
         if isinstance(query, list):
-            query = " ".join(str(item) for item in query)
+            query = " ".join(
+                str(item)
+                for item in query
+            )
 
         query_str = str(query).strip()
 
@@ -156,16 +219,18 @@ def register(ctx):
                 }
             )
 
-        available_tools = _get_available_tools(ctx, kwargs)
+        available_tools = _get_available_tools(
+            ctx,
+            kwargs,
+        )
 
-        payload_tools = [
-            tool
-            for tool in (
-                _extract_tool_info(item)
-                for item in available_tools
-            )
-            if tool["name"]
-        ]
+        payload_tools = []
+
+        for item in available_tools:
+            tool_info = _extract_tool_info(item)
+
+            if tool_info["name"]:
+                payload_tools.append(tool_info)
 
         payload = {
             "query": query_str,
@@ -188,12 +253,20 @@ def register(ctx):
                     "matched_tools": [],
                     "count": 0,
                     "error": (
-                        "SMART_FILTER_SERVICE_URL is not configured"
+                        "SMART_FILTER_SERVICE_URL "
+                        "is not configured"
                     ),
                 }
             )
 
         try:
+            logger.debug(
+                "[Smart-Filter] Searching for %r "
+                "among %d tools",
+                query_str,
+                len(payload_tools),
+            )
+
             response = requests.post(
                 f"{service_url}/filter",
                 json=payload,
@@ -202,22 +275,37 @@ def register(ctx):
             )
 
             response.raise_for_status()
+
             response_data = response.json()
 
-            matched_items = response_data.get("tools", [])
+            matched_items = response_data.get(
+                "tools",
+                [],
+            )
 
-            matched_names = [
-                item["name"]
-                for item in matched_items
-                if isinstance(item, dict) and item.get("name")
-            ]
+            matched_names = []
+
+            for item in matched_items:
+                if (
+                    isinstance(item, dict)
+                    and item.get("name")
+                ):
+                    matched_names.append(
+                        item["name"]
+                    )
+
+                elif isinstance(item, str):
+                    matched_names.append(item)
 
             logger.info(
                 "[Smart-Filter] Query=%r -> %d tools "
                 "(top_score=%s)",
                 query_str,
                 len(matched_names),
-                response_data.get("top_score", "N/A"),
+                response_data.get(
+                    "top_score",
+                    "N/A",
+                ),
             )
 
             return json.dumps(
@@ -239,62 +327,60 @@ def register(ctx):
 
             return json.dumps(
                 {
-                    "error": f"Semantic search unavailable: {exc}",
+                    "error": (
+                        f"Semantic search unavailable: {exc}"
+                    ),
                     "matched_tools": [],
                     "count": 0,
                 }
             )
 
-        except (ValueError, TypeError) as exc:
+        except (
+            ValueError,
+            TypeError,
+            KeyError,
+        ) as exc:
             logger.error(
-                "[Smart-Filter] Invalid response from service: %s",
+                "[Smart-Filter] Invalid response "
+                "from semantic service: %s",
                 exc,
             )
 
             return json.dumps(
                 {
-                    "error": f"Invalid semantic search response: {exc}",
+                    "error": (
+                        "Invalid semantic search response: "
+                        f"{exc}"
+                    ),
                     "matched_tools": [],
                     "count": 0,
                 }
             )
 
-    # Prefer the dedicated override API when available.
-    register_override = getattr(
+    register_tool = getattr(
         ctx,
-        "register_tool_override",
+        "register_tool",
         None,
     )
 
-    if callable(register_override):
-        register_override(
-            "tool_search",
-            handle_semantic_tool_search,
-        )
-
-        logger.info(
-            "[Smart-Filter] Registered tool_search via "
-            "register_tool_override()."
-        )
-        return
-
-    # Compatibility fallback for Hermes versions that expose
-    # register_tool() instead.
-    register_tool = getattr(ctx, "register_tool", None)
-
     if not callable(register_tool):
         raise RuntimeError(
-            "Hermes PluginContext provides neither "
-            "register_tool_override() nor register_tool()."
+            "Hermes PluginContext does not provide "
+            "register_tool()."
         )
 
     register_tool(
         name="tool_search",
+        toolset="tools",
         schema=TOOL_SEARCH_SCHEMA,
         handler=handle_semantic_tool_search,
+        description=(
+            "Semantically search available tools "
+            "using the Smart Filter service."
+        ),
         override=True,
     )
 
     logger.info(
-        "[Smart-Filter] Registered tool_search via register_tool()."
+        "[Smart-Filter] tool_search override registered."
     )
