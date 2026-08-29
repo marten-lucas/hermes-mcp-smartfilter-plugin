@@ -421,9 +421,11 @@ def create_handler(ctx: Any):
             )
 
             matched_names: list[str] = []
+            used_method = "fastembed"
             for tool_info, score, method in matched_tuples:
                 name = tool_info["name"]
                 matched_names.append(name)
+                used_method = method
 
                 if name not in tools_map:
                     tools_map[name] = {
@@ -432,10 +434,18 @@ def create_handler(ctx: Any):
                         "search_method": method,
                     }
 
+            if debug_mode:
+                import sys
+                print(
+                    f"\n[FastEmbed-Override] Query: {q!r} -> {len(matched_names)} matches (engine={used_method})",
+                    file=sys.stderr,
+                )
+
             results.append(
                 {
                     "query": q,
                     "matches": matched_names,
+                    "engine": used_method,
                 }
             )
 
@@ -443,6 +453,7 @@ def create_handler(ctx: Any):
             {
                 "queries": queries,
                 "total_available": len(extracted_tools),
+                "search_engine": f"fastembed ({_ENGINE.model_name})",
                 "results": results,
                 "tools": tools_map,
             },
