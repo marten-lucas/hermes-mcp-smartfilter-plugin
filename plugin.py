@@ -183,8 +183,10 @@ def register(ctx):
     if not callable(register_tool):
         raise RuntimeError("Hermes PluginContext does not provide register_tool().")
 
+    # Korrigierte Registrierung mit 'tools' als 2. positionalem Parameter
     register_tool(
-        name="semantic_tool_search",
+        "semantic_tool_search",
+        "tools",
         schema=SEMANTIC_SEARCH_SCHEMA,
         handler=handle_semantic_tool_search,
         description="Semantically search available tools via FastEmbed service.",
