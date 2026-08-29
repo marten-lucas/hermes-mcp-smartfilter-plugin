@@ -1,8 +1,8 @@
 name: mcp-smart-filter
-version: 1.10.1
+version: 1.11.0
 manifest_version: 1
 api_version: 1
-description: Replaces Hermes native BM25 tool_search with FastEmbed semantic vector search.
+description: Provides FastEmbed semantic vector search for Hermes tool discovery.
 author: Marten Lucas
 homepage: https://github.com/marten-lucas/hermes-mcp-smartfilter-plugin
 license: MIT
