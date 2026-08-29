@@ -1,11 +1,11 @@
-"""Tool schemas for the MCP Smart Filter plugin."""
+"""Tool schemas for the FastEmbed tool search plugin."""
 
-SEMANTIC_TOOL_SEARCH = {
-    "name": "semantic_tool_search",
+TOOL_SEARCH_SCHEMA = {
+    "name": "tool_search",
     "description": (
-        "Semantically search the available MCP and plugin tools for one or "
-        "more capabilities. Use this when you need to discover a specialized "
-        "tool without knowing its exact name."
+        "Search available deferred tools using semantic vector search and "
+        "natural-language queries. Returns relevant tool names, descriptions, "
+        "and similarity scores."
     ),
     "parameters": {
         "type": "object",
@@ -17,18 +17,24 @@ SEMANTIC_TOOL_SEARCH = {
                 },
                 "description": (
                     "One or more natural-language descriptions of the "
-                    "capabilities you need. Each query is searched independently."
+                    "capabilities or tools you need. Each query is searched independently."
                 ),
             },
             "limit": {
                 "type": "integer",
                 "description": (
                     "Maximum number of matching tools returned per query. "
-                    "Defaults to the configured value."
+                    "Default is 8 (min: 1, max: 50)."
                 ),
             },
         },
         "required": ["queries"],
     },
+}
+
+# Backward compatibility alias
+SEMANTIC_TOOL_SEARCH = {
+    **TOOL_SEARCH_SCHEMA,
+    "name": "semantic_tool_search",
 }
 

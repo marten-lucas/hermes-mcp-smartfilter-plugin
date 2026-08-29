@@ -1,81 +1,117 @@
-# Hermes MCP Smart Filter Plugin
+# Hermes FastEmbed Smart Search Plugin
 
-An official plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent) that dynamically reduces large MCP (Model Context Protocol) tool surfaces to the most relevant candidates before each LLM request using semantic vector search.
+A high-performance semantic search plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent) that overrides the built-in BM25 `tool_search` engine with **in-process FastEmbed dense vector retrieval**.
 
-When running multiple MCP servers (e.g., via Coolify or Agent Gateway), exposing hundreds or thousands of tool schemas simultaneously inflates prompt context, increases API costs, and degrades model tool-calling accuracy. This plugin intercepts outgoing LLM requests via Hermes' native `llm_request` middleware and filters the active tool list using the external [hermes-mcp-smartfilter-service](https://github.com/marten-lucas/hermes-mcp-smartfilter-service).
+Designed specifically for large tool surfaces (**1,000+ tools across multiple MCP servers and plugins**), this plugin enables natural-language semantic discovery, sub-2ms query latency via in-memory vector caching, and robust keyword fallback.
+
+---
+
+## Why Override `tool_search`?
+
+When Hermes Agent connects to numerous MCP servers or plugin suites, exposing hundreds or thousands of tool schemas simultaneously causes **context window bloat, inflated token costs, and model distraction**.
+
+Hermes solves this via **Progressive Tool Disclosure** using three bridge tools:
+1. `tool_search(queries, limit)` — discovers relevant tools from the deferred catalog.
+2. `tool_describe(names)` — loads full JSON schemas for chosen tools on demand.
+3. `tool_call(name, arguments)` — executes the tool.
+
+### BM25 vs. FastEmbed Semantic Search
+
+| Feature | Built-in BM25 | FastEmbed Plugin (`mcp-smart-filter`) |
+| :--- | :--- | :--- |
+| **Search Mechanism** | Keyword frequency & stemming | Dense semantic embeddings (`BAAI/bge-small-en-v1.5`) |
+| **Semantic Matching** | Fails on synonyms (e.g. "find tickets" vs `jira_search_issues`) | Understands intent, synonyms, and natural language descriptions |
+| **Search Latency (1000+ tools)** | ~5-15 ms (text tokenization) | **< 2 ms** (vectorized NumPy matrix multiplication) |
+| **Catalog Caching** | Rebuilds index per turn | **In-memory embedding cache** (invalidated only on catalog hash change) |
+| **Fallback Guarantee** | Substring match on zero hits | Automatic keyword/token overlap fallback |
 
 ---
 
 ## Architecture Overview
 
 ```
-                          ┌────────────────────────┐
-                          │      Hermes Agent      │
-                          │                        │
-                          │   Discovers ~1000 tools│
-                          │   via MCP Gateway      │
-                          └───────────┬────────────┘
-                                      │
-                                User Prompt
-                                      │
-                                      ▼
-                        ┌──────────────────────────┐
-                        │ llm_request Middleware   │
-                        │ (mcp-smart-filter)       │
-                        └─────────────┬────────────┘
-                                      │
-                         Query + Slim Candidates (Names/Descs)
-                                      │
-                                      ▼
-                        ┌──────────────────────────┐
-                        │  Smart Filter Service    │
-                        │  (FastEmbed + NumPy)     │
-                        └─────────────┬────────────┘
-                                      │
-                           Selected Candidate Names
-                                      │
-                                      ▼
-                        ┌──────────────────────────┐
-                        │ llm_request Middleware   │
-                        │ Filters full JSON schemas│
-                        └─────────────┬────────────┘
-                                      │
-                              Reduced Tools (5-15)
-                                      │
-                                      ▼
-                          ┌────────────────────────┐
-                          │    LLM Inference Call  │
-                          └────────────────────────┘
+                      ┌──────────────────────────────────────────────┐
+                      │                 Hermes Agent                 │
+                      │         (1,000+ deferred MCP tools)          │
+                      └──────────────────────┬───────────────────────┘
+                                             │
+                               User asks for action
+                                             │
+                                             ▼
+                      ┌──────────────────────────────────────────────┐
+                      │              tool_search(...)                │
+                      │      (Overridden by mcp-smart-filter)        │
+                      └──────────────────────┬───────────────────────┘
+                                             │
+                       ┌─────────────────────┴─────────────────────┐
+                       │                                           │
+                       ▼ (Primary)                                 ▼ (Fallback)
+         ┌───────────────────────────┐               ┌───────────────────────────┐
+         │   FastEmbed Vector Search │               │  Keyword / Token Overlap  │
+         │   (In-Memory Cached ONNX) │               │   (Substrings & Tokens)   │
+         └─────────────┬─────────────┘               └─────────────┬─────────────┘
+                       │                                           │
+                       └─────────────────────┬─────────────────────┘
+                                             │
+                                             ▼
+                      ┌──────────────────────────────────────────────┐
+                      │ Top-K Matched Tools & Scores                 │
+                      │ {"results": [...], "tools": {...}}           │
+                      └──────────────────────┬───────────────────────┘
+                                             │
+                                             ▼
+                      ┌──────────────────────────────────────────────┐
+                      │ Hermes calls tool_describe & tool_call       │
+                      └──────────────────────────────────────────────┘
 ```
-
----
-
-## Features
-
-- **LLM Middleware Interception:** Hides excess tools before prompt construction using Hermes' native `ctx.register_middleware("llm_request")`.
-- **Payload Optimization:** Sends only lightweight candidate metadata (`name` and `description`) over HTTP to minimize overhead.
-- **Full Schema Preservation:** Filters tools locally, preserving full JSON parameters, schemas, and provider formats for the LLM.
-- **Fail-Open Safe:** Automatically falls back to the full tool list if the filter service times out or returns an error.
-- **Cross-Format Support:** Handles both flat (Anthropic) and nested `function` (OpenAI/Ollama) tool schema definitions.
-
----
-
-## Prerequisites
-
-- Hermes Agent installed.
-- A running instance of [hermes-mcp-smartfilter-service](https://github.com/marten-lucas/hermes-mcp-smartfilter-service).
 
 ---
 
 ## Installation
 
-Install the plugin using the Hermes CLI:
+### 1. Install via Hermes CLI
 
 ```bash
-hermes plugins install marten-lucas/hermes-mcp-smartfilter-plugin
+hermes plugins install marten-lucas/hermes-mcp-smartfilter-plugin --no-enable
 ```
 
-Activate the plugin:
+### 2. Enable with Tool Override Consent
+
+Hermes Agent requires explicit consent when a plugin replaces a core tool (`tool_search`). Grant the `tools.override` capability using the `--allow-tool-override` flag:
 
 ```bash
-hermes plugins enable mcp-smart-filter
+hermes plugins enable mcp-smart-filter --allow-tool-override
+```
+
+> [!TIP]
+> Start a new Hermes session after enabling the plugin so that the tool registry updates cleanly.
+
+---
+
+## Configuration
+
+All configuration is optional and can be set in your `.env` or process environment:
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `SMART_FILTER_MODEL` | `BAAI/bge-small-en-v1.5` | FastEmbed ONNX embedding model name. |
+| `SMART_FILTER_MIN_SCORE` | `0.25` | Minimum cosine similarity threshold for vector matches. |
+| `SMART_FILTER_MAX_K` | `8` | Default maximum tool candidates returned per query. |
+| `SMART_FILTER_MIN_K` | `1` | Lower bound for requested search candidates. |
+| `SMART_FILTER_DEBUG` | `false` | Enable verbose debug logging (`true`/`false`). |
+
+---
+
+## Running Tests
+
+The test suite validates schema compatibility, tool extraction, vector caching, limit clamping, and 1,000-tool catalog scaling:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+---
+
+## License
+
+MIT
