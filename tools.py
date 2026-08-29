@@ -131,10 +131,12 @@ class FastEmbedSearchEngine:
             logger.info(
                 "[Smart-Filter] Initializing FastEmbed model %r...", self.model_name
             )
-            self._model = TextEmbedding(model_name=self.model_name)
+            threads = int(os.environ.get("SMART_FILTER_THREADS", "1"))
+            self._model = TextEmbedding(model_name=self.model_name, threads=threads)
             logger.info(
-                "[Smart-Filter] FastEmbed model %r loaded successfully.",
+                "[Smart-Filter] FastEmbed model %r loaded successfully (threads=%d).",
                 self.model_name,
+                threads,
             )
             return True
         except ImportError:
