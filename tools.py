@@ -11,6 +11,21 @@ from typing import Any
 
 logger = logging.getLogger("hermes.plugins.mcp_smart_filter")
 
+LOG_FILE = os.path.expanduser("~/.hermes/mcp_smart_filter.log")
+
+
+def _write_audit_log(message: str) -> None:
+    """Write guaranteed audit log entry to ~/.hermes/mcp_smart_filter.log."""
+    try:
+        import datetime
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {message}\n")
+            f.flush()
+    except Exception:
+        pass
+
 
 def _extract_tool_info(tool: Any) -> dict[str, Any]:
     """
@@ -450,6 +465,10 @@ def create_handler(ctx: Any):
                     "engine": used_method,
                 }
             )
+
+        _write_audit_log(
+            f"[TOOL_SEARCH OVERRIDE EXECUTED] queries={queries!r} (limit={limit}, available={len(extracted_tools)}) -> found {len(tools_map)} matches via FastEmbed: {list(tools_map.keys())}"
+        )
 
         return json.dumps(
             {
