@@ -13,5 +13,7 @@ python_dependencies:
 requires_env:
   - SMART_FILTER_SERVICE_URL
   - SMART_FILTER_API_KEY
+provides_tools:
+  - semantic_tool_search
 capabilities:
   - tools.override
