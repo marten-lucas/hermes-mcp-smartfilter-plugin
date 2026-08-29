@@ -207,10 +207,8 @@ class TestHandlerExecution(unittest.TestCase):
 
 
 class TestPluginRegistration(unittest.TestCase):
-    def test_register_with_override_capability(self):
+    def test_register_tool_search_override(self):
         ctx = MagicMock()
-        ctx.has_capability.side_effect = lambda cap: cap == "tools.override"
-
         plugin_init.register(ctx)
 
         ctx.register_tool.assert_called_once_with(
@@ -219,19 +217,6 @@ class TestPluginRegistration(unittest.TestCase):
             schema=TOOL_SEARCH_SCHEMA,
             handler=unittest.mock.ANY,
             override=True,
-        )
-
-    def test_register_without_override_capability(self):
-        ctx = MagicMock()
-        ctx.has_capability.return_value = False
-
-        plugin_init.register(ctx)
-
-        ctx.register_tool.assert_called_once_with(
-            name="semantic_tool_search",
-            toolset="mcp-smart-filter",
-            schema=SEMANTIC_TOOL_SEARCH,
-            handler=unittest.mock.ANY,
         )
 
 

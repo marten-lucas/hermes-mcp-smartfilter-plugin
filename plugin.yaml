@@ -24,8 +24,8 @@ capabilities:
   - tools.override
 
 python_dependencies:
-  - "fastembed>=0.3.0"
-  - "numpy>=1.20.0"
+  - "fastembed>=0.3.0,<1"
+  - "numpy>=1.20.0,<3"
 
 requires_env: []
 
