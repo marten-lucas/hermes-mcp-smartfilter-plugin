@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import threading
 from typing import Any
 
 logger = logging.getLogger("hermes.plugins.mcp_smart_filter")
@@ -83,6 +84,10 @@ def _get_available_tools(ctx: Any, kwargs: dict[str, Any]) -> list[Any]:
     """
     Defensively obtain the current Hermes tool catalogue from arguments,
     context manager, or plugin context.
+
+    Hinweis: ctx._manager ist private API und kann sich ohne
+    Deprecation-Window ändern — der Pfad ist best effort; der öffentliche
+    ctx.get_tools()-Pfad ist die stabile Quelle.
     """
     tools = kwargs.get("tools") or kwargs.get("available_tools")
     if tools:
@@ -129,9 +134,12 @@ class FastEmbedSearchEngine:
         )
         self._model: Any = None
         self._model_failed: bool = False
-        self._cached_fingerprint: str | None = None
-        self._cached_tools: list[dict[str, Any]] = []
-        self._cached_embeddings: Any = None  # np.ndarray of shape (N, D)
+        # Thread-sicherer Cache: unveränderlicher Snapshot (fingerprint, tools,
+        # embeddings), atomar getauscht. Hermes läuft mehrthreadig (Delegations,
+        # Background-Worker) — ein geteilter Lock verhindert, dass ein Thread
+        # Embeddings mit einer veralteten Tool-Liste indexiert.
+        self._cache_lock = threading.Lock()
+        self._cache: tuple[str, list[dict[str, Any]], Any] | None = None
 
     def _init_model(self) -> bool:
         """Lazy load FastEmbed TextEmbedding model."""
@@ -185,19 +193,21 @@ class FastEmbedSearchEngine:
         """
         Check if tool catalog has changed. If changed, recompute and cache embeddings.
         Returns True if embeddings are ready.
+
+        Thread-safety: der Lock schützt Modell-Init und Cache-Tausch. Der
+        teure Embedding-Recompute läuft außerhalb des Locks (kein Blockieren
+        paralleler Suchen), der Snapshot-Tausch selbst ist atomar.
         """
         if not tools:
-            self._cached_fingerprint = None
-            self._cached_tools = []
-            self._cached_embeddings = None
+            with self._cache_lock:
+                self._cache = None
             return False
 
         current_fp = self._compute_fingerprint(tools)
-        if (
-            self._cached_fingerprint == current_fp
-            and self._cached_embeddings is not None
-        ):
-            return True
+
+        with self._cache_lock:
+            if self._cache is not None and self._cache[0] == current_fp:
+                return True
 
         if not self._init_model():
             return False
@@ -218,9 +228,10 @@ class FastEmbedSearchEngine:
             norms[norms == 0] = 1.0
             normalized_embeddings = embeddings / norms
 
-            self._cached_fingerprint = current_fp
-            self._cached_tools = tools
-            self._cached_embeddings = normalized_embeddings
+            # Atomarer Snapshot-Tausch: Leser sehen immer konsistente
+            # (fingerprint, tools, embeddings)-Tripel.
+            with self._cache_lock:
+                self._cache = (current_fp, tools, normalized_embeddings)
 
             logger.info(
                 "[Smart-Filter] Cached embeddings for %d tools (dim=%d, fingerprint=%s)",
@@ -252,9 +263,16 @@ class FastEmbedSearchEngine:
             return []
 
         # Try semantic search with FastEmbed
-        if self._sync_tool_catalog(tools) and self._cached_embeddings is not None:
+        if self._sync_tool_catalog(tools):
             try:
                 import numpy as np  # type: ignore
+
+                # Konsistenten Snapshot lesen (atomar unter Lock)
+                with self._cache_lock:
+                    snapshot = self._cache
+                if snapshot is None:
+                    return self._keyword_search(query_str, tools, limit=limit)
+                _, cached_tools, cached_embeddings = snapshot
 
                 raw_q_emb = list(self._model.embed([query_str]))[0]
                 q_emb = np.array(raw_q_emb, dtype=np.float32)
@@ -263,7 +281,7 @@ class FastEmbedSearchEngine:
                     q_emb = q_emb / q_norm
 
                 # Compute cosine similarities via matrix multiplication
-                scores = np.dot(self._cached_embeddings, q_emb)
+                scores = np.dot(cached_embeddings, q_emb)
 
                 # Rank by descending score
                 ranked_indices = np.argsort(-scores)
@@ -273,7 +291,7 @@ class FastEmbedSearchEngine:
                     score = float(scores[idx])
                     if score < min_score:
                         break
-                    matches.append((self._cached_tools[idx], score, "fastembed"))
+                    matches.append((cached_tools[idx], score, "fastembed"))
                     if len(matches) >= limit:
                         break
 

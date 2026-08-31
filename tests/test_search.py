@@ -169,6 +169,21 @@ class TestHandlerExecution(unittest.TestCase):
         ctx = MagicMock()
         handler = create_handler(ctx)
 
+        # Kein queries-Feld
+        response = json.loads(handler(args={}, available_tools=self.tools))
+        self.assertIn("error", response)
+        self.assertEqual(response["results"], [])
+        self.assertEqual(response["total_available"], 0)
+
+        # Leeres queries-Array
+        response = json.loads(handler(args={"queries": ["", "   "]}, available_tools=self.tools))
+        self.assertIn("error", response)
+        self.assertEqual(response["results"], [])
+
+        # Legacy-Feld "query" mit leerem String
+        response = json.loads(handler(args={"query": ""}, available_tools=self.tools))
+        self.assertIn("error", response)
+
     def test_large_catalog_1000_tools(self):
         # Generate 1000 synthetic tools across different domains
         large_toolset = [

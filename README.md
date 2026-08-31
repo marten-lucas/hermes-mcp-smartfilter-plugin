@@ -99,6 +99,7 @@ All configuration is optional and can be set in your `.env` or process environme
 | `SMART_FILTER_MAX_K` | `8` | Default maximum tool candidates returned per query. |
 | `SMART_FILTER_MIN_K` | `1` | Lower bound for requested search candidates. |
 | `SMART_FILTER_DEBUG` | `false` | Enable verbose debug logging (`true`/`false`). |
+| `SMART_FILTER_THREADS` | `1` | ONNX intra-op threads for the FastEmbed model. |
 
 ---
 
