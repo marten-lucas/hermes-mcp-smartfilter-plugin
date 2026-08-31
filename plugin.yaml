@@ -18,7 +18,7 @@ tags:
   - fastembed
   - smart-routing
 
-kind: general
+kind: standalone
 
 capabilities:
   - tools.override
@@ -30,4 +30,7 @@ python_dependencies:
 requires_env: []
 
 provides_tools:
+  # Primär: Override des nativen tool_search (erfordert Capability tools.override).
+  # Fallback: eigenständige Registrierung als semantic_tool_search.
   - tool_search
+  - semantic_tool_search
