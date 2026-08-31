@@ -111,6 +111,39 @@ The test suite validates schema compatibility, tool extraction, vector caching, 
 python3 -m unittest discover -s tests -v
 ```
 
+## Diagnostics
+
+The plugin writes an audit log to `~/.hermes/mcp_smart_filter.log`:
+
+- `[PLUGIN LOADED]` — registration outcome (native override vs. fallback)
+- `[TOOL_SEARCH OVERRIDE EXECUTED]` — every search with queries, limit, catalog size, and matched tool names
+
+## Troubleshooting
+
+**Plugin registers as `semantic_tool_search` instead of overriding `tool_search`**
+
+The `tools.override` capability was not granted. Re-enable with consent:
+
+```bash
+hermes plugins enable mcp-smart-filter --allow-tool-override
+```
+
+**Searches always use `keyword_fallback` engine**
+
+The `fastembed` package is not installed in Hermes' Python environment:
+
+```bash
+pip install "fastembed>=0.3.0,<1"
+```
+
+**Plugin does not appear in `hermes plugins list`**
+
+Run discovery diagnostics:
+
+```bash
+HERMES_PLUGINS_DEBUG=1 hermes plugins list
+```
+
 ---
 
 ## License
