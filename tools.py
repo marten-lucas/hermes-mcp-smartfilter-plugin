@@ -83,11 +83,7 @@ def _extract_tool_info(tool: Any) -> dict[str, Any]:
 def _get_available_tools(ctx: Any, kwargs: dict[str, Any]) -> list[Any]:
     """
     Defensively obtain the current Hermes tool catalogue from arguments,
-    context manager, or plugin context.
-
-    Hinweis: ctx._manager ist private API und kann sich ohne
-    Deprecation-Window ändern — der Pfad ist best effort; der öffentliche
-    ctx.get_tools()-Pfad ist die stabile Quelle.
+    context manager, PluginContext, or the local MCP schema cache.
     """
     tools = kwargs.get("tools") or kwargs.get("available_tools")
     if tools:
@@ -101,7 +97,8 @@ def _get_available_tools(ctx: Any, kwargs: dict[str, Any]) -> list[Any]:
                 result = get_tools()
                 if isinstance(result, dict):
                     return list(result.values())
-                return list(result or [])
+                if result:
+                    return list(result)
             except Exception:
                 logger.exception("[Smart-Filter] Failed to read tools from ctx._manager")
 
@@ -111,11 +108,47 @@ def _get_available_tools(ctx: Any, kwargs: dict[str, Any]) -> list[Any]:
             result = get_tools()
             if isinstance(result, dict):
                 return list(result.values())
-            return list(result or [])
+            if result:
+                return list(result)
         except Exception:
             logger.exception("[Smart-Filter] Failed to read tools from PluginContext")
 
-    return []
+    # Fallback to local MCP schema cache and ToolRegistry
+    cached_tools: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    try:
+        from tools.registry import registry
+        for name, entry in getattr(registry, "_tools", {}).items():
+            if name not in seen:
+                seen.add(name)
+                cached_tools.append({
+                    "name": name,
+                    "description": getattr(entry, "description", "") or "",
+                    "parameters": [],
+                })
+    except Exception:
+        pass
+
+    cache_path = os.path.expanduser("~/.hermes/cache/mcp_schema_cache.json")
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+            for server_name, server_data in cache.items():
+                for t in server_data.get("tools", []):
+                    tool_name = f"mcp__{server_name.replace(' ', '_')}__" + t["name"]
+                    if tool_name not in seen:
+                        seen.add(tool_name)
+                        cached_tools.append({
+                            "name": tool_name,
+                            "description": t.get("description") or "",
+                            "parameters": list(t.get("inputSchema", {}).get("properties", {}).keys()),
+                        })
+        except Exception:
+            pass
+
+    return cached_tools
 
 
 class FastEmbedSearchEngine:
@@ -503,3 +536,64 @@ def create_handler(ctx: Any):
         )
 
     return handle_tool_search
+
+
+def create_pre_llm_hook(ctx: Any):
+    """
+    Create a pre_llm_call hook callback that semantically routes relevant MCP tools
+    directly into the user message context, avoiding blind guessing or bias towards
+    arbitrary visible tools.
+    """
+    min_score = float(os.environ.get("SMART_FILTER_PRE_LLM_MIN_SCORE", "0.55"))
+    max_tools = int(os.environ.get("SMART_FILTER_PRE_LLM_MAX_TOOLS", "4"))
+    enabled = os.environ.get("SMART_FILTER_PRE_LLM_ENABLED", "true").lower() in {"true", "1", "yes", "on"}
+
+    def on_pre_llm_call(user_message: Any = None, **kwargs: Any) -> dict[str, str] | None:
+        if not enabled:
+            return None
+
+        # Extract text from user_message (can be str or dict with content/text)
+        text = ""
+        if isinstance(user_message, str):
+            text = user_message.strip()
+        elif isinstance(user_message, dict):
+            text = str(user_message.get("content") or user_message.get("text") or "").strip()
+
+        if not text or len(text) < 5:
+            return None
+
+        # Ignore slash commands or system reset signals
+        if text.startswith("/") or text.startswith('"/') or text.startswith("[System note:"):
+            return None
+
+        raw_tools = _get_available_tools(ctx, kwargs)
+        extracted: list[dict[str, Any]] = []
+        for item in raw_tools:
+            info = _extract_tool_info(item)
+            if info["name"]:
+                extracted.append(info)
+
+        if not extracted:
+            return None
+
+        matches = _ENGINE.search(query=text, tools=extracted, limit=max_tools, min_score=min_score)
+        if not matches:
+            return None
+
+        lines = [
+            "### Relevant MCP Tools discovered for this request:",
+            "The following tools match your request best. You can invoke them directly via tool_call or describe them:",
+        ]
+        matched_names = []
+        for tool_info, score, method in matches:
+            name = tool_info["name"]
+            matched_names.append(name)
+            desc = (tool_info.get("description") or "").split("\n")[0].strip()[:140]
+            lines.append(f"- `{name}`: {desc}")
+
+        _write_audit_log(
+            f"[PRE_LLM_CALL ROUTING] query={text!r} -> matched {len(matched_names)} tools (engine={matches[0][2]}): {matched_names}"
+        )
+        return {"context": "\n".join(lines)}
+
+    return on_pre_llm_call

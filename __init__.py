@@ -4,14 +4,14 @@ import logging
 
 try:
     from . import schemas
-    from .tools import create_handler, _write_audit_log
+    from .tools import create_handler, create_pre_llm_hook, _write_audit_log
 except (ImportError, ValueError):
     import schemas  # type: ignore
-    from tools import create_handler, _write_audit_log  # type: ignore
+    from tools import create_handler, create_pre_llm_hook, _write_audit_log  # type: ignore
 
 logger = logging.getLogger("hermes.plugins.mcp_smart_filter")
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 
 def _patch_native_bridge(handler):
@@ -47,7 +47,7 @@ def _patch_native_bridge(handler):
 
 
 def register(ctx):
-    """Register the FastEmbed tool_search handler in Hermes Agent.
+    """Register the FastEmbed tool_search handler and pre_llm_call hook in Hermes Agent.
 
     Bevorzugt Override des nativen tool_search (Capability tools.override).
     Schlägt die Registrierung mit override=True fehl (kein Consent, ältere
@@ -57,6 +57,17 @@ def register(ctx):
     handler = create_handler(ctx)
     _patch_native_bridge(handler)
 
+    # 1. Register pre_llm_call hook to surface relevant tools directly into context
+    try:
+        pre_llm_callback = create_pre_llm_hook(ctx)
+        ctx.register_hook("pre_llm_call", pre_llm_callback)
+        _write_audit_log("[PLUGIN LOADED] Registered 'pre_llm_call' hook.")
+        logger.info("[Smart-Filter] Registered 'pre_llm_call' hook.")
+    except Exception as exc:
+        _write_audit_log(f"[PLUGIN LOADED] Failed to register 'pre_llm_call': {exc}")
+        logger.warning("[Smart-Filter] Failed to register 'pre_llm_call' hook: %s", exc)
+
+    # 2. Register tool_search handler
     try:
         _write_audit_log("[PLUGIN LOADED] Registering tool_search (override=True)")
         ctx.register_tool(
