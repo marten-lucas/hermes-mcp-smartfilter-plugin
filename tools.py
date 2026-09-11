@@ -464,7 +464,10 @@ def create_handler(ctx: Any):
 
                 if name not in tools_map:
                     tools_map[name] = {
+                        "source": "mcp" if name.startswith("mcp__") else "plugin",
+                        "source_name": name.split("__")[1] if "__" in name else "",
                         "description": tool_info["description"][:400],
+                        "required": [p for p in tool_info.get("parameters", []) if isinstance(p, str)][:32],
                         "score": round(score, 3),
                         "search_method": method,
                     }
