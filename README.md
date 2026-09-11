@@ -95,11 +95,28 @@ All configuration is optional and can be set in your `.env` or process environme
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `SMART_FILTER_MODEL` | `BAAI/bge-small-en-v1.5` | FastEmbed ONNX embedding model name. |
-| `SMART_FILTER_MIN_SCORE` | `0.25` | Minimum cosine similarity threshold for vector matches. |
+| `SMART_FILTER_MIN_SCORE` | `0.25` | Minimum cosine similarity threshold for vector matches in `tool_search`. |
 | `SMART_FILTER_MAX_K` | `8` | Default maximum tool candidates returned per query. |
 | `SMART_FILTER_MIN_K` | `1` | Lower bound for requested search candidates. |
 | `SMART_FILTER_DEBUG` | `false` | Enable verbose debug logging (`true`/`false`). |
 | `SMART_FILTER_THREADS` | `1` | ONNX intra-op threads for the FastEmbed model. |
+| `SMART_FILTER_PRE_LLM_ENABLED` | `true` | Enable proactive `pre_llm_call` contextual tool injection. |
+| `SMART_FILTER_PRE_LLM_MIN_SCORE` | `0.55` | Relevance score threshold for injecting tools directly into turn context. |
+| `SMART_FILTER_PRE_LLM_MAX_TOOLS` | `4` | Maximum number of candidate tools injected per turn. |
+| `SMART_FILTER_LIVE_RBAC_DISCOVERY` | `false` | If `true`, queries live `tools/list` on `agentgateway` with the user's `X-User-Groups` headers (cached with 60s TTL) to reflect dynamic RBAC rules directly. |
+
+---
+
+## Proactive Tool Routing (`pre_llm_call`) & Dynamic RBAC
+
+When using large MCP setups, models often suffer from bias toward tools that fit into the visible prompt manifest, ignoring hundreds of deferred tools.
+
+`mcp-smart-filter` solves this on two levels:
+1. **Bridge Intercept:** Overrides native `tools.tool_search` to guarantee high-accuracy FastEmbed semantic retrieval instead of lexical BM25 misses.
+2. **Proactive `pre_llm_call` Routing:** Evaluates the user's message before the LLM generates a response, semantically discovers the top matching MCP tools, and injects their signatures directly into the user turn's context.
+3. **Live RBAC Awareness (`SMART_FILTER_LIVE_RBAC_DISCOVERY=true`):** When enabled, tool discovery queries the gateway at runtime using the caller's identity headers (`X-On-Behalf-Of` / `X-User-Groups`). Users only see and receive tools their groups are authorized for (e.g. `it-admin` vs. `vorstand`), maintaining zero configuration drift with gateway security policies.
+
+---
 
 ---
 

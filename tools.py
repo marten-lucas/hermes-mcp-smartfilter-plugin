@@ -151,6 +151,143 @@ def _get_available_tools(ctx: Any, kwargs: dict[str, Any]) -> list[Any]:
     return cached_tools
 
 
+_LIVE_TOOLS_CACHE: dict[tuple[str, str], tuple[list[dict[str, Any]], float]] = {}
+_LIVE_CACHE_LOCK = threading.Lock()
+
+
+def _fetch_live_mcp_tools(groups: str = "", timeout: float = 12.0, ttl: float = 60.0) -> list[dict[str, Any]]:
+    """
+    Query configured MCP servers (specifically agentgateway) with the caller's
+    X-User-Groups / X-On-Behalf-Of headers to obtain the exact list of tools
+    authorized by the gateway at runtime. Results are cached in-memory per group
+    string with a configurable TTL.
+    """
+    import time
+    now = time.time()
+    cache_key = ("agentgateway", groups)
+
+    with _LIVE_CACHE_LOCK:
+        if cache_key in _LIVE_TOOLS_CACHE:
+            cached_tools, timestamp = _LIVE_TOOLS_CACHE[cache_key]
+            if now - timestamp < ttl:
+                return cached_tools
+
+    # Find agentgateway config
+    endpoint = ""
+    auth_header = ""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        mcp_servers = cfg.get("mcp_servers") or {}
+        ag_cfg = mcp_servers.get("agentgateway") or {}
+        endpoint = ag_cfg.get("url") or ""
+        headers_cfg = ag_cfg.get("headers") or {}
+        auth_header = headers_cfg.get("Authorization") or ""
+    except Exception:
+        pass
+
+    # Fallback to env file if auth token has template string
+    if not auth_header or "${" in auth_header:
+        token = os.environ.get("AGENTGATEWAY_BEARER_TOKEN", "")
+        if not token:
+            env_path = os.path.expanduser("~/.hermes/.env")
+            if os.path.exists(env_path):
+                try:
+                    with open(env_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            if "AGENTGATEWAY_BEARER_TOKEN" in line:
+                                token = line.split("=", 1)[1].strip().strip('"').strip("'")
+                                break
+                except Exception:
+                    pass
+        if token:
+            auth_header = f"Bearer {token}"
+
+    if not endpoint:
+        endpoint = "https://mcp.cloud.kiga-gramschatz.de/mcp"
+
+    if not auth_header:
+        logger.warning("[Smart-Filter] Cannot perform live MCP discovery: missing Authorization token.")
+        return []
+
+    try:
+        import httpx
+
+        headers = {
+            "Authorization": auth_header,
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if groups:
+            headers["X-User-Groups"] = groups
+
+        with httpx.Client(headers=headers, timeout=timeout) as client:
+            # 1. Initialize session
+            r_init = client.post(
+                endpoint,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {"name": "hermes-smart-filter", "version": "2.3"},
+                    },
+                },
+            )
+            session_id = r_init.headers.get("mcp-session-id")
+            if not session_id:
+                logger.warning("[Smart-Filter] Live MCP discovery initialize returned no session ID.")
+                return []
+
+            client.headers["mcp-session-id"] = session_id
+
+            # 2. tools/list
+            r_list = client.post(
+                endpoint,
+                json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            )
+
+        tools: list[dict[str, Any]] = []
+        for line in r_list.text.splitlines():
+            if line.startswith("data: "):
+                data = json.loads(line[6:])
+                raw_tools = data.get("result", {}).get("tools", [])
+                for t in raw_tools:
+                    name = t.get("name", "")
+                    if not name.startswith("mcp__"):
+                        tool_name = f"mcp__agentgateway__{name}"
+                    else:
+                        tool_name = name
+                    desc = t.get("description") or ""
+                    params = list(t.get("inputSchema", {}).get("properties", {}).keys())
+                    tools.append({
+                        "name": tool_name,
+                        "description": desc,
+                        "parameters": params,
+                        "search_text": f"{tool_name} - {desc}" + (f" - parameters: {', '.join(params)}" if params else ""),
+                    })
+                break
+
+        with _LIVE_CACHE_LOCK:
+            _LIVE_TOOLS_CACHE[cache_key] = (tools, now)
+
+        logger.info(
+            "[Smart-Filter] Live MCP discovery: retrieved %d tools for groups=%r (TTL=%.0fs)",
+            len(tools),
+            groups,
+            ttl,
+        )
+        _write_audit_log(
+            f"[LIVE MCP DISCOVERY] groups={groups!r} -> fetched {len(tools)} authorized tools from {endpoint}"
+        )
+        return tools
+    except Exception as exc:
+        logger.error("[Smart-Filter] Failed to query live MCP tools from %s: %s", endpoint, exc)
+        return []
+
+
 class FastEmbedSearchEngine:
     """
     In-process FastEmbed semantic search engine with in-memory vector caching.
@@ -547,6 +684,7 @@ def create_pre_llm_hook(ctx: Any):
     min_score = float(os.environ.get("SMART_FILTER_PRE_LLM_MIN_SCORE", "0.55"))
     max_tools = int(os.environ.get("SMART_FILTER_PRE_LLM_MAX_TOOLS", "4"))
     enabled = os.environ.get("SMART_FILTER_PRE_LLM_ENABLED", "true").lower() in {"true", "1", "yes", "on"}
+    live_rbac_discovery = os.environ.get("SMART_FILTER_LIVE_RBAC_DISCOVERY", "false").lower() in {"true", "1", "yes", "on"}
 
     def on_pre_llm_call(user_message: Any = None, **kwargs: Any) -> dict[str, str] | None:
         if not enabled:
@@ -566,12 +704,29 @@ def create_pre_llm_hook(ctx: Any):
         if text.startswith("/") or text.startswith('"/') or text.startswith("[System note:"):
             return None
 
-        raw_tools = _get_available_tools(ctx, kwargs)
+        # Resolve current user groups via hermes-x-on-behalf if available
+        user_groups = ""
+        try:
+            from hermes_plugins.hermes_x_on_behalf.context import get_current_principal
+            p = get_current_principal()
+            if p and p.groups:
+                user_groups = ",".join(sorted(p.groups))
+        except Exception:
+            pass
+
+        # Live RBAC Discovery or Local Schema Cache
         extracted: list[dict[str, Any]] = []
-        for item in raw_tools:
-            info = _extract_tool_info(item)
-            if info["name"]:
-                extracted.append(info)
+        if live_rbac_discovery:
+            live_tools = _fetch_live_mcp_tools(groups=user_groups)
+            if live_tools:
+                extracted = live_tools
+
+        if not extracted:
+            raw_tools = _get_available_tools(ctx, kwargs)
+            for item in raw_tools:
+                info = _extract_tool_info(item)
+                if info["name"]:
+                    extracted.append(info)
 
         if not extracted:
             return None
