@@ -11,7 +11,43 @@ except (ImportError, ValueError):
 
 logger = logging.getLogger("hermes.plugins.mcp_smart_filter")
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
+
+
+def _pre_warm_engine_in_background(ctx):
+    """
+    Pre-warm the FastEmbed model and initial tool catalog embeddings in a background
+    thread immediately after startup, so the first user turn experiences sub-5ms response
+    times without triggering hook timeouts or memory spikes.
+    """
+    import threading
+
+    def _worker():
+        try:
+            from .tools import _get_available_tools, _extract_tool_info, _ENGINE
+        except (ImportError, ValueError):
+            from tools import _get_available_tools, _extract_tool_info, _ENGINE  # type: ignore
+
+        try:
+            logger.info("[Smart-Filter] Pre-warming FastEmbed model and catalog in background...")
+            _write_audit_log("[PRE-WARM] Background pre-warm started.")
+            _ENGINE._init_model()
+            raw_tools = _get_available_tools(ctx, {})
+            extracted = []
+            for item in raw_tools:
+                info = _extract_tool_info(item)
+                if info["name"]:
+                    extracted.append(info)
+            if extracted:
+                _ENGINE._sync_tool_catalog(extracted)
+                logger.info("[Smart-Filter] Background pre-warm completed (%d tools indexed).", len(extracted))
+                _write_audit_log(f"[PRE-WARM] Background pre-warm completed successfully ({len(extracted)} tools).")
+        except Exception as exc:
+            logger.warning("[Smart-Filter] Background pre-warm error (non-fatal): %s", exc)
+            _write_audit_log(f"[PRE-WARM] Pre-warm failed: {exc}")
+
+    t = threading.Thread(target=_worker, daemon=True, name="fastembed-prewarm")
+    t.start()
 
 
 def _patch_native_bridge(handler):
@@ -56,6 +92,7 @@ def register(ctx):
     """
     handler = create_handler(ctx)
     _patch_native_bridge(handler)
+    _pre_warm_engine_in_background(ctx)
 
     # 1. Register pre_llm_call hook to surface relevant tools directly into context
     try:

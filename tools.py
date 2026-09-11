@@ -390,7 +390,13 @@ class FastEmbedSearchEngine:
                 "[Smart-Filter] Generating embeddings for %d tools...", len(texts)
             )
 
-            raw_embeddings = list(self._model.embed(texts))
+            # Generate embeddings in smaller chunks (batch_size=16) to conserve memory
+            # and avoid OOM inside constrained cgroups
+            raw_embeddings = []
+            for i in range(0, len(texts), 32):
+                chunk = texts[i : i + 32]
+                raw_embeddings.extend(list(self._model.embed(chunk, batch_size=16)))
+
             embeddings = np.array(raw_embeddings, dtype=np.float32)
 
             # Normalize embeddings to unit length for fast cosine similarity via dot product
@@ -707,12 +713,30 @@ def create_pre_llm_hook(ctx: Any):
         # Resolve current user groups via hermes-x-on-behalf if available
         user_groups = ""
         try:
-            from hermes_plugins.hermes_x_on_behalf.context import get_current_principal
-            p = get_current_principal()
-            if p and p.groups:
+            import sys
+            mod = sys.modules.get("hermes_plugins.hermes_x_on_behalf.context")
+            get_p = getattr(mod, "get_principal", None) if mod else None
+            p = get_p() if callable(get_p) else None
+            if p and getattr(p, "groups", None):
                 user_groups = ",".join(sorted(p.groups))
         except Exception:
             pass
+
+        # Fallback for user identity from turn arguments or session
+        if not user_groups:
+            sender_id = str(kwargs.get("sender_id") or "").strip().lower()
+            if not sender_id:
+                try:
+                    meta = kwargs.get("session_metadata") or {}
+                    sender_id = str(meta.get("user_id") or "").strip().lower()
+                except Exception:
+                    pass
+
+            # Known role mappings from x_on_behalf config
+            if sender_id in ("vorstand", "admin"):
+                user_groups = "it-admin,vorstand"
+            elif sender_id in ("kiga-team", "elternbeirat"):
+                user_groups = sender_id
 
         # Live RBAC Discovery or Local Schema Cache
         extracted: list[dict[str, Any]] = []
