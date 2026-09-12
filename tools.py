@@ -703,10 +703,13 @@ def create_pre_llm_hook(ctx: Any):
         elif isinstance(user_message, dict):
             text = str(user_message.get("content") or user_message.get("text") or "").strip()
 
+        # Clean off prepended [System note: ...] headers (e.g. session-reset notices from Hermes/Talk)
+        text = re.sub(r"^\[System note:[^\]]+\]\s*", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+
         if not text or len(text) < 5:
             return None
 
-        # Ignore slash commands or system reset signals
+        # Ignore slash commands or isolated system signals
         if text.startswith("/") or text.startswith('"/') or text.startswith("[System note:"):
             return None
 
