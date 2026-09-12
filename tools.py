@@ -29,18 +29,30 @@ def _write_audit_log(message: str) -> None:
 
 
 def _sanitize_mcp_name_component(value: str) -> str:
-    """Mirror Hermes Core's ``tools.mcp_tool_schema.sanitize_mcp_name_component``.
+    """Prefer Hermes Core's ``tools.mcp_tool_schema.sanitize_mcp_name_component``.
 
     Replaces every char outside ``[A-Za-z0-9_]`` (hyphens included) with ``_``,
     so that names we recommend to the LLM exactly match the names Hermes
-    registers in its tool registry.
+    registers in its tool registry. Falls back to an identical local
+    implementation when Hermes Core is unavailable (e.g. standalone tests).
     """
-    return re.sub(r"[^A-Za-z0-9_]", "_", str(value or ""))
+    try:
+        from tools.mcp_tool_schema import sanitize_mcp_name_component as _core_sanitize
+        return _core_sanitize(value)
+    except Exception:
+        return re.sub(r"[^A-Za-z0-9_]", "_", str(value or ""))
 
 
 def _make_mcp_name(server: str, tool: str) -> str:
-    """Build the registry/wire name ``mcp__<sanitizedServer>__<sanitizedTool>``."""
-    return f"mcp__{_sanitize_mcp_name_component(server)}__{_sanitize_mcp_name_component(tool)}"
+    """Build the registry/wire name ``mcp__<sanitizedServer>__<sanitizedTool>``.
+
+    Prefers Hermes Core's ``mcp_prefixed_tool_name`` when available.
+    """
+    try:
+        from tools.mcp_tool_schema import mcp_prefixed_tool_name as _core_prefix
+        return _core_prefix(server, tool)
+    except Exception:
+        return f"mcp__{_sanitize_mcp_name_component(server)}__{_sanitize_mcp_name_component(tool)}"
 
 
 def _extract_tool_info(tool: Any) -> dict[str, Any]:

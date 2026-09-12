@@ -11,7 +11,7 @@ except (ImportError, ValueError):
 
 logger = logging.getLogger("hermes.plugins.mcp_smart_filter")
 
-__version__ = "2.4.3"
+__version__ = "2.4.4"
 
 
 def _pre_warm_engine_in_background(ctx):
