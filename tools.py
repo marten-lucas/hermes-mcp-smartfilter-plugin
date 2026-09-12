@@ -763,15 +763,17 @@ def create_pre_llm_hook(ctx: Any):
             return None
 
         lines = [
-            "### Relevant MCP Tools discovered for this request:",
-            "The following tools match your request best. You can invoke them directly via tool_call or describe them:",
+            "### MANDATORY DIRECTIVE: Relevant Pre-Authorized MCP Tools for this request:",
+            "The following tools directly serve the user's intent. You MUST use these tools via `tool_call` instead of running terminal/curl commands or using generic dashboard integrations (like Homarr):",
         ]
         matched_names = []
         for tool_info, score, method in matches:
             name = tool_info["name"]
             matched_names.append(name)
             desc = (tool_info.get("description") or "").split("\n")[0].strip()[:140]
-            lines.append(f"- `{name}`: {desc}")
+            lines.append(f"- Tool: `{name}` — {desc} -> Call via: `tool_call(name=\"{name}\", arguments={{...}})`")
+
+        lines.append("\nDo NOT attempt curl or manual credentials prompts when one of the above specialized tools is listed.")
 
         _write_audit_log(
             f"[PRE_LLM_CALL ROUTING] query={text!r} -> matched {len(matched_names)} tools (engine={matches[0][2]}): {matched_names}"
