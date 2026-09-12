@@ -28,6 +28,21 @@ def _write_audit_log(message: str) -> None:
         pass
 
 
+def _sanitize_mcp_name_component(value: str) -> str:
+    """Mirror Hermes Core's ``tools.mcp_tool_schema.sanitize_mcp_name_component``.
+
+    Replaces every char outside ``[A-Za-z0-9_]`` (hyphens included) with ``_``,
+    so that names we recommend to the LLM exactly match the names Hermes
+    registers in its tool registry.
+    """
+    return re.sub(r"[^A-Za-z0-9_]", "_", str(value or ""))
+
+
+def _make_mcp_name(server: str, tool: str) -> str:
+    """Build the registry/wire name ``mcp__<sanitizedServer>__<sanitizedTool>``."""
+    return f"mcp__{_sanitize_mcp_name_component(server)}__{_sanitize_mcp_name_component(tool)}"
+
+
 def _extract_tool_info(tool: Any) -> dict[str, Any]:
     """
     Extract searchable name, description, and parameter information
@@ -137,7 +152,7 @@ def _get_available_tools(ctx: Any, kwargs: dict[str, Any]) -> list[Any]:
                 cache = json.load(f)
             for server_name, server_data in cache.items():
                 for t in server_data.get("tools", []):
-                    tool_name = f"mcp__{server_name.replace(' ', '_')}__" + t["name"]
+                    tool_name = _make_mcp_name(server_name, t["name"])
                     if tool_name not in seen:
                         seen.add(tool_name)
                         cached_tools.append({
@@ -256,10 +271,15 @@ def _fetch_live_mcp_tools(groups: str = "", timeout: float = 12.0, ttl: float = 
                 raw_tools = data.get("result", {}).get("tools", [])
                 for t in raw_tools:
                     name = t.get("name", "")
-                    if not name.startswith("mcp__"):
-                        tool_name = f"mcp__agentgateway__{name}"
+                    if name.startswith("mcp__"):
+                        # Already registry-form: normalize every component anyway
+                        parts = name.split("__", 2)
+                        if len(parts) == 3:
+                            tool_name = _make_mcp_name(parts[1], parts[2])
+                        else:
+                            tool_name = name
                     else:
-                        tool_name = name
+                        tool_name = _make_mcp_name("agentgateway", name)
                     desc = t.get("description") or ""
                     params = list(t.get("inputSchema", {}).get("properties", {}).keys())
                     tools.append({
