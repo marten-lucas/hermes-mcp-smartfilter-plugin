@@ -748,9 +748,26 @@ def create_pre_llm_hook(ctx: Any):
         # Resolve current user groups via hermes-x-on-behalf if available
         user_groups = ""
         try:
+            import importlib
             import sys
-            mod = sys.modules.get("hermes_plugins.hermes_x_on_behalf.context")
-            get_p = getattr(mod, "get_principal", None) if mod else None
+
+            # Das Paket registriert sich als "hermes_x_on_behalf" (Underscores);
+            # der Hermes-Plugin-Loader kann es zusätzlich unter "hermes_plugins.hermes_x_on_behalf"
+            # importieren. get_principal() liegt im .context-Modul.
+            get_p = None
+            for module_name in (
+                "hermes_x_on_behalf.context",
+                "hermes_plugins.hermes_x_on_behalf.context",
+            ):
+                mod = sys.modules.get(module_name)
+                if mod is None:
+                    try:
+                        mod = importlib.import_module(module_name)
+                    except Exception:
+                        mod = None
+                get_p = getattr(mod, "get_principal", None) if mod else None
+                if callable(get_p):
+                    break
             p = get_p() if callable(get_p) else None
             if p and getattr(p, "groups", None):
                 user_groups = ",".join(sorted(p.groups))
