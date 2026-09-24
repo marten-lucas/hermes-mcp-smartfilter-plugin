@@ -11,7 +11,7 @@ except (ImportError, ValueError):
 
 logger = logging.getLogger("hermes.plugins.mcp_smart_filter")
 
-__version__ = "2.4.4"
+__version__ = "2.4.5"
 
 
 def _pre_warm_engine_in_background(ctx):
@@ -65,13 +65,24 @@ def _patch_native_bridge(handler):
 
         orig_dispatch = ts.dispatch_tool_search
 
-        def fastembed_dispatch(args, *, current_tool_defs, config=None):
+        def fastembed_dispatch(args, *, current_tool_defs, config=None, connector_search=None):
             try:
                 # Run FastEmbed handler passing current_tool_defs for discovery
                 return handler(args=args, tools=current_tool_defs)
             except Exception as exc:
                 logger.error("[Smart-Filter] FastEmbed dispatch failed, falling back to BM25: %s", exc)
-                return orig_dispatch(args, current_tool_defs=current_tool_defs, config=config)
+                # Hermes >= v0.21.4 added a ``connector_search`` keyword to
+                # tools.tool_search.dispatch_tool_search. Forward it when the
+                # native dispatcher accepts it; older 0.20.x signatures lack it.
+                try:
+                    return orig_dispatch(
+                        args,
+                        current_tool_defs=current_tool_defs,
+                        config=config,
+                        connector_search=connector_search,
+                    )
+                except TypeError:
+                    return orig_dispatch(args, current_tool_defs=current_tool_defs, config=config)
 
         ts.dispatch_tool_search = fastembed_dispatch
         ts._fastembed_patched = True
