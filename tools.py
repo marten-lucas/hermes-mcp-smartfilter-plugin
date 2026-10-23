@@ -1,14 +1,18 @@
-"""FastEmbed-backed semantic tool search for Hermes Agent."""
+"""Ollama-backed semantic tool search for Hermes Agent."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import threading
+import time
+from collections.abc import Callable
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger("hermes.plugins.mcp_smart_filter")
 
@@ -320,140 +324,295 @@ def _fetch_live_mcp_tools(groups: str = "", timeout: float = 12.0, ttl: float = 
         return []
 
 
-class FastEmbedSearchEngine:
-    """
-    In-process FastEmbed semantic search engine with in-memory vector caching.
-    Computes embeddings once per toolset fingerprint, enabling sub-2ms searches
-    across 1000+ tools.
-    """
+def _normalize_ollama_root(base_url: str) -> str:
+    """Convert an Ollama/OpenAI base URL to the native Ollama API root."""
+    value = str(base_url or "").strip()
+    if not value:
+        return ""
+    if value.startswith(":"):
+        value = "http://127.0.0.1" + value
+    elif "://" not in value:
+        value = "http://" + value
 
-    def __init__(self, model_name: str | None = None) -> None:
+    parsed = urlsplit(value)
+    path = parsed.path.rstrip("/")
+    for suffix in ("/api/tags", "/v1/models", "/api", "/v1"):
+        if path.endswith(suffix):
+            path = path[:-len(suffix)].rstrip("/")
+            break
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
+
+
+def _secret_from_hermes(key_env: str) -> str:
+    if not key_env:
+        return ""
+    try:
+        from agent.secret_scope import get_secret_str
+
+        value = get_secret_str(key_env, "")
+        if value:
+            return str(value).strip()
+    except Exception:
+        pass
+    return os.environ.get(key_env, "").strip()
+
+
+def _resolve_ollama_connection() -> tuple[str, dict[str, str]]:
+    """Reuse either Hermes' legacy custom provider or its providers.ollama entry."""
+    explicit_url = os.environ.get("SMART_FILTER_OLLAMA_BASE_URL", "").strip()
+    explicit_key = os.environ.get("SMART_FILTER_OLLAMA_API_KEY", "").strip()
+    config: dict[str, Any] = {}
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+    except Exception:
+        pass
+
+    ollama_entry: dict[str, Any] = {}
+    providers = config.get("providers") or {}
+    if isinstance(providers, dict) and isinstance(providers.get("ollama"), dict):
+        ollama_entry = providers["ollama"]
+    if not ollama_entry:
+        custom_providers = config.get("custom_providers") or []
+        if isinstance(custom_providers, list):
+            ollama_entry = next(
+                (
+                    entry for entry in custom_providers
+                    if isinstance(entry, dict)
+                    and str(entry.get("name", "")).strip().lower() == "ollama"
+                ),
+                {},
+            )
+
+    model_config = config.get("model") or {}
+    if not isinstance(model_config, dict):
+        model_config = {}
+    base_url = (
+        explicit_url
+        or str(ollama_entry.get("base_url") or ollama_entry.get("api") or ollama_entry.get("url") or "").strip()
+        or str(model_config.get("base_url") or "").strip()
+    )
+
+    raw_headers = ollama_entry.get("extra_headers") or ollama_entry.get("headers") or {}
+    headers = {
+        str(name): str(value)
+        for name, value in raw_headers.items()
+    } if isinstance(raw_headers, dict) else {}
+
+    api_key = explicit_key or str(ollama_entry.get("api_key") or model_config.get("api_key") or "").strip()
+    key_env = str(ollama_entry.get("key_env") or ollama_entry.get("api_key_env") or "").strip()
+    if not explicit_key and key_env:
+        api_key = _secret_from_hermes(key_env) or api_key
+    if api_key.startswith("${") and api_key.endswith("}"):
+        api_key = _secret_from_hermes(api_key[2:-1])
+
+    if api_key:
+        headers = {name: value for name, value in headers.items() if name.lower() != "authorization"}
+        headers["Authorization"] = f"Bearer {api_key}"
+    elif not any(name.lower() == "authorization" for name in headers):
+        api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+    if not base_url:
+        try:
+            from hermes_cli.models_local import _get_ollama_base_url
+
+            base_url = _get_ollama_base_url()
+        except Exception:
+            pass
+    if not base_url:
+        base_url = (
+            os.environ.get("OLLAMA_BASE_URL", "").strip()
+            or os.environ.get("OLLAMA_HOST", "").strip()
+        )
+
+    base_url = _normalize_ollama_root(base_url)
+    if not base_url:
+        raise RuntimeError(
+            "No Ollama endpoint configured; set SMART_FILTER_OLLAMA_BASE_URL "
+            "or configure an Ollama provider in Hermes."
+        )
+    if not urlsplit(base_url).hostname:
+        raise RuntimeError("The configured Ollama endpoint is not a valid HTTP URL.")
+
+    return f"{base_url}/api/embed", headers
+
+
+class OllamaSearchEngine:
+    """Semantic search using the configured Ollama embedding model and an in-memory cache."""
+
+    def __init__(
+        self,
+        model_name: str | None = None,
+        *,
+        connection_resolver: Callable[[], tuple[str, dict[str, str]]] | None = None,
+        client_factory: Callable[..., Any] | None = None,
+    ) -> None:
+
         self.model_name = (
             model_name
-            or os.environ.get("SMART_FILTER_MODEL")
-            or os.environ.get("SMART_ROUTING_MODEL")
-            or "BAAI/bge-small-en-v1.5"
+            or os.environ.get("SMART_FILTER_OLLAMA_MODEL")
+            or "qwen3-embedding:latest"
         )
-        self._model: Any = None
-        self._model_failed: bool = False
-        # Thread-sicherer Cache: unveränderlicher Snapshot (fingerprint, tools,
-        # embeddings), atomar getauscht. Hermes läuft mehrthreadig (Delegations,
-        # Background-Worker) — ein geteilter Lock verhindert, dass ein Thread
-        # Embeddings mit einer veralteten Tool-Liste indexiert.
+        self.batch_size = self._positive_int("SMART_FILTER_OLLAMA_BATCH_SIZE", 64)
+        self.threads = self._positive_int("SMART_FILTER_THREADS", 1)
+        self.timeout = self._positive_float("SMART_FILTER_OLLAMA_TIMEOUT", 30.0)
+        self.keep_alive = os.environ.get("SMART_FILTER_OLLAMA_KEEP_ALIVE", "5m").strip()
+        self._connection_resolver = connection_resolver or _resolve_ollama_connection
+        self._client_factory = client_factory
+        self._connection: tuple[str, dict[str, str]] | None = None
+        self._retry_after = 0.0
         self._cache_lock = threading.Lock()
-        self._cache: tuple[str, list[dict[str, Any]], Any] | None = None
+        self._build_lock = threading.Lock()
+        self._cache: tuple[str, list[dict[str, Any]], list[tuple[float, ...]]] | None = None
+
+        if os.environ.get("SMART_FILTER_MODEL") and not os.environ.get("SMART_FILTER_OLLAMA_MODEL"):
+            logger.info(
+                "[Smart-Filter] Ignoring legacy SMART_FILTER_MODEL for Ollama; "
+                "use SMART_FILTER_OLLAMA_MODEL to select the embedding model."
+            )
+
+    @staticmethod
+    def _positive_int(name: str, default: int) -> int:
+        try:
+            return max(1, int(os.environ.get(name, str(default))))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _positive_float(name: str, default: float) -> float:
+        try:
+            return max(0.1, float(os.environ.get(name, str(default))))
+        except (TypeError, ValueError):
+            return default
 
     def _init_model(self) -> bool:
-        """Lazy load FastEmbed TextEmbedding model."""
-        if self._model is not None:
-            return True
-        if self._model_failed:
-            return False
+        """Resolve the configured Ollama provider without exposing its credentials."""
 
+        if time.monotonic() < self._retry_after:
+            return False
+        if self._connection is not None:
+            return True
         try:
-            from fastembed import TextEmbedding  # type: ignore
-
+            self._connection = self._connection_resolver()
             logger.info(
-                "[Smart-Filter] Initializing FastEmbed model %r...", self.model_name
-            )
-            threads = int(os.environ.get("SMART_FILTER_THREADS", "1"))
-            self._model = TextEmbedding(model_name=self.model_name, threads=threads)
-            logger.info(
-                "[Smart-Filter] FastEmbed model %r loaded successfully (threads=%d).",
+                "[Smart-Filter] Ollama embedding provider ready (model=%s, host=%s).",
                 self.model_name,
-                threads,
+                urlsplit(self._connection[0]).hostname or "unknown",
             )
             return True
-        except ImportError:
-            logger.warning(
-                "[Smart-Filter] fastembed package is not installed. "
-                "Semantic vector search will fallback to keyword search."
-            )
-            self._model_failed = True
-            return False
         except Exception as exc:
-            logger.error(
-                "[Smart-Filter] Failed to initialize FastEmbed model %r: %s",
-                self.model_name,
-                exc,
-            )
-            self._model_failed = True
+            self._record_failure(exc)
             return False
 
     @staticmethod
+    def _normalize_vector(values: Any) -> tuple[float, ...]:
+        vector = tuple(float(value) for value in values)
+        if not vector or not all(math.isfinite(value) for value in vector):
+            raise ValueError("Ollama returned an empty or non-finite embedding vector")
+        norm = math.sqrt(sum(value * value for value in vector))
+        if norm == 0:
+            return vector
+        return tuple(value / norm for value in vector)
+
+    def _client(self):
+        factory = self._client_factory
+        if factory is None:
+            import httpx
+
+            factory = httpx.Client
+        return factory(timeout=self.timeout)
+
+    def _embed_texts(self, texts: list[str]) -> list[tuple[float, ...]]:
+        if not texts:
+            return []
+        if not self._init_model() or self._connection is None:
+            raise RuntimeError("Ollama embedding provider is unavailable")
+
+        endpoint, headers = self._connection
+        payload_options = {"num_gpu": 0, "num_thread": self.threads}
+        vectors: list[tuple[float, ...]] = []
+        with self._client() as client:
+            for start in range(0, len(texts), self.batch_size):
+                batch = texts[start:start + self.batch_size]
+                payload: dict[str, Any] = {
+                    "model": self.model_name,
+                    "input": batch,
+                    "options": payload_options,
+                }
+                if self.keep_alive:
+                    payload["keep_alive"] = self.keep_alive
+                response = client.post(endpoint, headers=headers, json=payload)
+                response.raise_for_status()
+                result = response.json()
+                embeddings = result.get("embeddings") if isinstance(result, dict) else None
+                if not isinstance(embeddings, list) or len(embeddings) != len(batch):
+                    raise ValueError("Ollama returned an unexpected embedding response")
+                vectors.extend(self._normalize_vector(vector) for vector in embeddings)
+        return vectors
+
+    def _record_failure(self, exc: Exception) -> None:
+        self._connection = None
+        self._retry_after = time.monotonic() + 15.0
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        suffix = f", HTTP {status}" if status is not None else ""
+        logger.warning(
+            "[Smart-Filter] Ollama embedding request failed (%s%s); "
+            "using keyword fallback.",
+            type(exc).__name__,
+            suffix,
+        )
+
+    @staticmethod
     def _compute_fingerprint(tools: list[dict[str, Any]]) -> str:
-        """Compute MD5 fingerprint of tool names and descriptions."""
+        """Compute a stable fingerprint of tool names and searchable descriptions."""
         hasher = hashlib.md5()
-        for t in sorted(tools, key=lambda x: x["name"]):
-            hasher.update(t["name"].encode("utf-8", errors="ignore"))
+        for tool in sorted(tools, key=lambda item: item["name"]):
+            hasher.update(tool["name"].encode("utf-8", errors="ignore"))
             hasher.update(b"\x00")
-            hasher.update(t["search_text"].encode("utf-8", errors="ignore"))
+            hasher.update(tool["search_text"].encode("utf-8", errors="ignore"))
             hasher.update(b"\x01")
         return hasher.hexdigest()
 
     def _sync_tool_catalog(self, tools: list[dict[str, Any]]) -> bool:
-        """
-        Check if tool catalog has changed. If changed, recompute and cache embeddings.
-        Returns True if embeddings are ready.
-
-        Thread-safety: der Lock schützt Modell-Init und Cache-Tausch. Der
-        teure Embedding-Recompute läuft außerhalb des Locks (kein Blockieren
-        paralleler Suchen), der Snapshot-Tausch selbst ist atomar.
-        """
+        """Embed and cache a tool catalog once per model and catalog fingerprint."""
         if not tools:
             with self._cache_lock:
                 self._cache = None
             return False
-
-        current_fp = self._compute_fingerprint(tools)
-
-        with self._cache_lock:
-            if self._cache is not None and self._cache[0] == current_fp:
-                return True
-
         if not self._init_model():
             return False
 
-        try:
-            import numpy as np  # type: ignore
+        fingerprint = f"{self.model_name}:{self._compute_fingerprint(tools)}"
+        with self._cache_lock:
+            if self._cache is not None and self._cache[0] == fingerprint:
+                return True
 
-            texts = [t["search_text"] for t in tools]
-            logger.debug(
-                "[Smart-Filter] Generating embeddings for %d tools...", len(texts)
-            )
-
-            # Generate embeddings in smaller chunks (batch_size=16) to conserve memory
-            # and avoid OOM inside constrained cgroups
-            raw_embeddings = []
-            for i in range(0, len(texts), 32):
-                chunk = texts[i : i + 32]
-                raw_embeddings.extend(list(self._model.embed(chunk, batch_size=16)))
-
-            embeddings = np.array(raw_embeddings, dtype=np.float32)
-
-            # Normalize embeddings to unit length for fast cosine similarity via dot product
-            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-            norms[norms == 0] = 1.0
-            normalized_embeddings = embeddings / norms
-
-            # Atomarer Snapshot-Tausch: Leser sehen immer konsistente
-            # (fingerprint, tools, embeddings)-Tripel.
+        with self._build_lock:
             with self._cache_lock:
-                self._cache = (current_fp, tools, normalized_embeddings)
-
-            logger.info(
-                "[Smart-Filter] Cached embeddings for %d tools (dim=%d, fingerprint=%s)",
-                len(tools),
-                normalized_embeddings.shape[1],
-                current_fp[:8],
-            )
-            return True
-        except Exception as exc:
-            logger.error(
-                "[Smart-Filter] Failed to embed tool catalog: %s",
-                exc,
-            )
-            return False
+                if self._cache is not None and self._cache[0] == fingerprint:
+                    return True
+            try:
+                vectors = self._embed_texts([tool["search_text"] for tool in tools])
+                if len(vectors) != len(tools):
+                    raise ValueError("Ollama returned an incomplete tool catalog embedding")
+                if len({len(vector) for vector in vectors}) != 1:
+                    raise ValueError("Ollama returned inconsistent embedding dimensions")
+                with self._cache_lock:
+                    self._cache = (fingerprint, tools, vectors)
+                logger.info(
+                    "[Smart-Filter] Cached Ollama embeddings for %d tools "
+                    "(dim=%d, fingerprint=%s).",
+                    len(tools),
+                    len(vectors[0]),
+                    fingerprint[-8:],
+                )
+                return True
+            except Exception as exc:
+                self._record_failure(exc)
+                return False
 
     def search(
         self,
@@ -462,63 +621,43 @@ class FastEmbedSearchEngine:
         limit: int = 8,
         min_score: float = 0.25,
     ) -> list[tuple[dict[str, Any], float, str]]:
-        """
-        Perform fast semantic search for query against tools catalog.
-        Returns list of (tool_dict, score, method).
-        """
-        query_str = query.strip()
-        if not query_str:
+        query_text = query.strip()
+        if not query_text:
             return []
+        if not self._sync_tool_catalog(tools):
+            return self._keyword_search(query_text, tools, limit=limit)
 
-        # Try semantic search with FastEmbed
-        if self._sync_tool_catalog(tools):
-            try:
-                import numpy as np  # type: ignore
+        try:
+            query_vector = self._embed_texts([query_text])[0]
+            with self._cache_lock:
+                snapshot = self._cache
+            if snapshot is None:
+                return self._keyword_search(query_text, tools, limit=limit)
+            _, cached_tools, cached_vectors = snapshot
+            if len(query_vector) != len(cached_vectors[0]):
+                raise ValueError("Ollama query and catalog embedding dimensions do not match")
 
-                # Konsistenten Snapshot lesen (atomar unter Lock)
-                with self._cache_lock:
-                    snapshot = self._cache
-                if snapshot is None:
-                    return self._keyword_search(query_str, tools, limit=limit)
-                _, cached_tools, cached_embeddings = snapshot
+            ranked = sorted(
+                (
+                    (sum(a * b for a, b in zip(vector, query_vector)), index)
+                    for index, vector in enumerate(cached_vectors)
+                ),
+                reverse=True,
+            )
+            matches: list[tuple[dict[str, Any], float, str]] = []
+            for score, index in ranked:
+                if score < min_score:
+                    break
+                matches.append((cached_tools[index], float(score), "ollama"))
+                if len(matches) >= limit:
+                    break
+            if matches:
+                return matches
+        except Exception as exc:
+            self._record_failure(exc)
 
-                raw_q_emb = list(self._model.embed([query_str]))[0]
-                q_emb = np.array(raw_q_emb, dtype=np.float32)
-                q_norm = np.linalg.norm(q_emb)
-                if q_norm > 0:
-                    q_emb = q_emb / q_norm
+        return self._keyword_search(query_text, tools, limit=limit)
 
-                # Compute cosine similarities via matrix multiplication
-                scores = np.dot(cached_embeddings, q_emb)
-
-                # Rank by descending score
-                ranked_indices = np.argsort(-scores)
-
-                matches: list[tuple[dict[str, Any], float, str]] = []
-                for idx in ranked_indices:
-                    score = float(scores[idx])
-                    if score < min_score:
-                        break
-                    matches.append((cached_tools[idx], score, "fastembed"))
-                    if len(matches) >= limit:
-                        break
-
-                if matches:
-                    return matches
-
-                logger.debug(
-                    "[Smart-Filter] No semantic matches >= %.2f for query %r; falling back to keyword search",
-                    min_score,
-                    query_str,
-                )
-            except Exception as exc:
-                logger.error(
-                    "[Smart-Filter] Error during FastEmbed query execution: %s",
-                    exc,
-                )
-
-        # Fallback to token / keyword match
-        return self._keyword_search(query_str, tools, limit=limit)
 
     @staticmethod
     def _keyword_search(
@@ -560,7 +699,7 @@ class FastEmbedSearchEngine:
 
 
 # Global engine instance for the process
-_ENGINE = FastEmbedSearchEngine()
+_ENGINE = OllamaSearchEngine()
 
 
 def _load_config() -> tuple[int, int, float]:
@@ -664,7 +803,7 @@ def create_handler(ctx: Any):
             )
 
             matched_names: list[str] = []
-            used_method = "fastembed"
+            used_method = "ollama"
             for tool_info, score, method in matched_tuples:
                 name = tool_info["name"]
                 matched_names.append(name)
@@ -683,7 +822,7 @@ def create_handler(ctx: Any):
             if debug_mode:
                 import sys
                 print(
-                    f"\n[FastEmbed-Override] Query: {q!r} -> {len(matched_names)} matches (engine={used_method})",
+                    f"\n[Smart-Filter] Query: {q!r} -> {len(matched_names)} matches (engine={used_method})",
                     file=sys.stderr,
                 )
 
@@ -695,15 +834,16 @@ def create_handler(ctx: Any):
                 }
             )
 
+        engines = sorted({result["engine"] for result in results})
         _write_audit_log(
-            f"[TOOL_SEARCH OVERRIDE EXECUTED] queries={queries!r} (limit={limit}, available={len(extracted_tools)}) -> found {len(tools_map)} matches via FastEmbed: {list(tools_map.keys())}"
+            f"[TOOL_SEARCH OVERRIDE EXECUTED] queries={queries!r} (limit={limit}, available={len(extracted_tools)}) -> engines={engines}, matches={list(tools_map.keys())}"
         )
 
         return json.dumps(
             {
                 "queries": queries,
                 "total_available": len(extracted_tools),
-                "search_engine": f"fastembed ({_ENGINE.model_name})",
+                "search_engine": f"ollama ({_ENGINE.model_name})",
                 "results": results,
                 "tools": tools_map,
             },

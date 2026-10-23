@@ -1,52 +1,75 @@
-"""Hermes FastEmbed Smart Search plugin."""
+"""Hermes Ollama-backed semantic Smart Search plugin."""
 
 import logging
 
 try:
     from . import schemas
-    from .tools import create_handler, create_pre_llm_hook, _write_audit_log
+    from .tools import _write_audit_log, create_handler, create_pre_llm_hook
 except (ImportError, ValueError):
     import schemas  # type: ignore
-    from tools import create_handler, create_pre_llm_hook, _write_audit_log  # type: ignore
+    from tools import (  # type: ignore
+        _write_audit_log,
+        create_handler,
+        create_pre_llm_hook,
+    )
 
 logger = logging.getLogger("hermes.plugins.mcp_smart_filter")
 
-__version__ = "2.4.5"
+__version__ = "2.5.0"
 
 
 def _pre_warm_engine_in_background(ctx):
     """
-    Pre-warm the FastEmbed model and initial tool catalog embeddings in a background
-    thread immediately after startup, so the first user turn experiences sub-5ms response
-    times without triggering hook timeouts or memory spikes.
+    Pre-warm the Ollama embedding model and initial tool catalog in a background
+    thread so the first user turn does not pay the catalog-indexing cost.
     """
     import threading
 
     def _worker():
         try:
-            from .tools import _get_available_tools, _extract_tool_info, _ENGINE
+            from .tools import _ENGINE, _extract_tool_info, _get_available_tools
         except (ImportError, ValueError):
-            from tools import _get_available_tools, _extract_tool_info, _ENGINE  # type: ignore
+            from tools import (  # type: ignore
+                _ENGINE,
+                _extract_tool_info,
+                _get_available_tools,
+            )
 
         try:
-            logger.info("[Smart-Filter] Pre-warming FastEmbed model and catalog in background...")
-            _write_audit_log("[PRE-WARM] Background pre-warm started.")
-            _ENGINE._init_model()
+            logger.info(
+                "[Smart-Filter] Pre-warming Ollama model and tool catalog in background..."
+            )
+            _write_audit_log("[PRE-WARM] Ollama catalog pre-warm started.")
             raw_tools = _get_available_tools(ctx, {})
             extracted = []
             for item in raw_tools:
                 info = _extract_tool_info(item)
                 if info["name"]:
                     extracted.append(info)
-            if extracted:
-                _ENGINE._sync_tool_catalog(extracted)
-                logger.info("[Smart-Filter] Background pre-warm completed (%d tools indexed).", len(extracted))
-                _write_audit_log(f"[PRE-WARM] Background pre-warm completed successfully ({len(extracted)} tools).")
+            if extracted and _ENGINE._sync_tool_catalog(extracted):
+                logger.info(
+                    "[Smart-Filter] Background pre-warm completed (%d tools indexed).",
+                    len(extracted),
+                )
+                _write_audit_log(
+                    f"[PRE-WARM] Ollama embeddings ready for {len(extracted)} tools."
+                )
+            elif extracted:
+                logger.info(
+                    "[Smart-Filter] Background pre-warm deferred; keyword fallback remains available."
+                )
+                _write_audit_log(
+                    "[PRE-WARM] Ollama unavailable; keyword fallback remains active."
+                )
         except Exception as exc:
-            logger.warning("[Smart-Filter] Background pre-warm error (non-fatal): %s", exc)
-            _write_audit_log(f"[PRE-WARM] Pre-warm failed: {exc}")
+            logger.warning(
+                "[Smart-Filter] Background pre-warm error (%s).", type(exc).__name__
+            )
+            _write_audit_log(
+                f"[PRE-WARM] Ollama pre-warm failed ({type(exc).__name__})."
+            )
 
-    t = threading.Thread(target=_worker, daemon=True, name="fastembed-prewarm")
+    t = threading.Thread(target=_worker, daemon=True, name="smart-filter-prewarm")
     t.start()
 
 
@@ -54,23 +77,28 @@ def _patch_native_bridge(handler):
     """
     Hermes 0.20.6 routes tool_search bridge calls directly in model_tools.py to
     tools.tool_search.dispatch_tool_search, bypassing the ToolRegistry.
-    Monkey-patching dispatch_tool_search ensures FastEmbed runs whenever the
+    Monkey-patching dispatch_tool_search ensures the semantic search engine runs whenever the
     LLM issues a tool_search call.
     """
     try:
         import tools.tool_search as ts
 
-        if getattr(ts, "_fastembed_patched", False):
+        if getattr(ts, "_smart_filter_patched", False):
             return
 
         orig_dispatch = ts.dispatch_tool_search
 
-        def fastembed_dispatch(args, *, current_tool_defs, config=None, connector_search=None):
+        def smart_filter_dispatch(
+            args, *, current_tool_defs, config=None, connector_search=None
+        ):
             try:
-                # Run FastEmbed handler passing current_tool_defs for discovery
+                # Pass current_tool_defs so the plugin can search the full deferred catalog.
                 return handler(args=args, tools=current_tool_defs)
             except Exception as exc:
-                logger.error("[Smart-Filter] FastEmbed dispatch failed, falling back to BM25: %s", exc)
+                logger.error(
+                    "[Smart-Filter] Dispatch failed, falling back to Hermes BM25: %s",
+                    exc,
+                )
                 # Hermes >= v0.21.4 added a ``connector_search`` keyword to
                 # tools.tool_search.dispatch_tool_search. Forward it when the
                 # native dispatcher accepts it; older 0.20.x signatures lack it.
@@ -82,19 +110,27 @@ def _patch_native_bridge(handler):
                         connector_search=connector_search,
                     )
                 except TypeError:
-                    return orig_dispatch(args, current_tool_defs=current_tool_defs, config=config)
+                    return orig_dispatch(
+                        args, current_tool_defs=current_tool_defs, config=config
+                    )
 
-        ts.dispatch_tool_search = fastembed_dispatch
-        ts._fastembed_patched = True
-        _write_audit_log("[PLUGIN LOADED] Native tools.tool_search.dispatch_tool_search successfully monkey-patched with FastEmbed.")
+        ts.dispatch_tool_search = smart_filter_dispatch
+        ts._smart_filter_patched = True
+        _write_audit_log(
+            "[PLUGIN LOADED] Native tools.tool_search.dispatch_tool_search patched with Ollama semantic search."
+        )
         logger.info("[Smart-Filter] Native tool_search monkey-patched successfully.")
     except Exception as exc:
-        _write_audit_log(f"[PLUGIN LOADED] Failed to monkey-patch tools.tool_search: {exc}")
-        logger.warning("[Smart-Filter] Could not monkey-patch tools.tool_search: %s", exc)
+        _write_audit_log(
+            f"[PLUGIN LOADED] Failed to monkey-patch tools.tool_search: {exc}"
+        )
+        logger.warning(
+            "[Smart-Filter] Could not monkey-patch tools.tool_search: %s", exc
+        )
 
 
 def register(ctx):
-    """Register the FastEmbed tool_search handler and pre_llm_call hook in Hermes Agent.
+    """Register the Ollama semantic tool_search handler and pre_llm_call hook in Hermes Agent.
 
     Bevorzugt Override des nativen tool_search (Capability tools.override).
     Schlägt die Registrierung mit override=True fehl (kein Consent, ältere
@@ -126,7 +162,9 @@ def register(ctx):
             override=True,
         )
     except Exception as exc:
-        _write_audit_log(f"[PLUGIN LOADED] Fallback to semantic_tool_search due to: {exc}")
+        _write_audit_log(
+            f"[PLUGIN LOADED] Fallback to semantic_tool_search due to: {exc}"
+        )
         logger.warning(
             "[Smart-Filter] Cannot override 'tool_search' (%s). "
             "Registering as 'semantic_tool_search'. "

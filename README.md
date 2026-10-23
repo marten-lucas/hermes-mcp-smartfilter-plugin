@@ -1,168 +1,99 @@
-# Hermes FastEmbed Smart Search Plugin
+# Hermes Ollama Smart Filter
 
-A high-performance semantic search plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent) that overrides the built-in BM25 `tool_search` engine with **in-process FastEmbed dense vector retrieval**.
+Semantic MCP-tool discovery for Hermes Agent. The plugin overrides Hermes' native BM25 `tool_search`, embeds the current tool catalog and each query through the **Ollama provider already configured in Hermes**, and ranks the cached vectors locally. It keeps keyword matching as a fallback when Ollama cannot be reached.
 
-Designed specifically for large tool surfaces (**1,000+ tools across multiple MCP servers and plugins**), this plugin enables natural-language semantic discovery, sub-2ms query latency via in-memory vector caching, and robust keyword fallback.
+The default embedding model is `qwen3-embedding:latest`; this is separate from Hermes' chat model. The plugin sends batches to Ollama's native `POST /api/embed` endpoint, requests CPU execution (`num_gpu: 0`) and defaults to one CPU thread. It does not require FastEmbed, ONNX Runtime, NumPy, or a separate embedding service.
 
----
+## Why override `tool_search`?
 
-## Why Override `tool_search`?
+Hermes' built-in BM25 search is fast and dependency-free, but lexical matching can miss relevant tools when the user's wording differs from a tool's name or description. Semantic embeddings provide a better match for large deferred catalogs (1,000+ tools) without putting every schema in the prompt.
 
-When Hermes Agent connects to numerous MCP servers or plugin suites, exposing hundreds or thousands of tool schemas simultaneously causes **context window bloat, inflated token costs, and model distraction**.
+| Feature | Hermes BM25 | Ollama Smart Filter |
+| --- | --- | --- |
+| Matching | Lexical | Semantic vector similarity |
+| Embedding runtime | None | Existing configured Ollama provider |
+| Catalog processing | Per-search lexical index | Batched once per catalog fingerprint, cached in memory |
+| Failure behavior | Native search | Keyword fallback in the plugin; dispatch exceptions fall back to Hermes BM25 |
 
-Hermes solves this via **Progressive Tool Disclosure** using three bridge tools:
-1. `tool_search(queries, limit)` — discovers relevant tools from the deferred catalog.
-2. `tool_describe(names)` — loads full JSON schemas for chosen tools on demand.
-3. `tool_call(name, arguments)` — executes the tool.
+## Installation and enablement
 
-### BM25 vs. FastEmbed Semantic Search
-
-| Feature | Built-in BM25 | FastEmbed Plugin (`mcp-smart-filter`) |
-| :--- | :--- | :--- |
-| **Search Mechanism** | Keyword frequency & stemming | Dense semantic embeddings (`BAAI/bge-small-en-v1.5`) |
-| **Semantic Matching** | Fails on synonyms (e.g. "find tickets" vs `jira_search_issues`) | Understands intent, synonyms, and natural language descriptions |
-| **Search Latency (1000+ tools)** | ~5-15 ms (text tokenization) | **< 2 ms** (vectorized NumPy matrix multiplication) |
-| **Catalog Caching** | Rebuilds index per turn | **In-memory embedding cache** (invalidated only on catalog hash change) |
-| **Fallback Guarantee** | Substring match on zero hits | Automatic keyword/token overlap fallback |
-
----
-
-## Architecture Overview
-
-```
-                      ┌──────────────────────────────────────────────┐
-                      │                 Hermes Agent                 │
-                      │         (1,000+ deferred MCP tools)          │
-                      └──────────────────────┬───────────────────────┘
-                                             │
-                               User asks for action
-                                             │
-                                             ▼
-                      ┌──────────────────────────────────────────────┐
-                      │              tool_search(...)                │
-                      │      (Overridden by mcp-smart-filter)        │
-                      └──────────────────────┬───────────────────────┘
-                                             │
-                       ┌─────────────────────┴─────────────────────┐
-                       │                                           │
-                       ▼ (Primary)                                 ▼ (Fallback)
-         ┌───────────────────────────┐               ┌───────────────────────────┐
-         │   FastEmbed Vector Search │               │  Keyword / Token Overlap  │
-         │   (In-Memory Cached ONNX) │               │   (Substrings & Tokens)   │
-         └─────────────┬─────────────┘               └─────────────┬─────────────┘
-                       │                                           │
-                       └─────────────────────┬─────────────────────┘
-                                             │
-                                             ▼
-                      ┌──────────────────────────────────────────────┐
-                      │ Top-K Matched Tools & Scores                 │
-                      │ {"results": [...], "tools": {...}}           │
-                      └──────────────────────┬───────────────────────┘
-                                             │
-                                             ▼
-                      ┌──────────────────────────────────────────────┐
-                      │ Hermes calls tool_describe & tool_call       │
-                      └──────────────────────────────────────────────┘
-```
-
----
-
-## Installation
-
-### 1. Install via Hermes CLI
+The plugin has **no Python package dependencies of its own**. It uses Hermes' existing `httpx` and Ollama configuration. Install it as usual, then explicitly consent to overriding the core tool:
 
 ```bash
 hermes plugins install marten-lucas/hermes-mcp-smartfilter-plugin --no-enable
-```
-
-### 2. Enable with Tool Override Consent
-
-Hermes Agent requires explicit consent when a plugin replaces a core tool (`tool_search`). Grant the `tools.override` capability using the `--allow-tool-override` flag:
-
-```bash
 hermes plugins enable mcp-smart-filter --allow-tool-override
 ```
 
-> [!TIP]
-> Start a new Hermes session after enabling the plugin so that the tool registry updates cleanly.
+Start a new Hermes session or restart the gateway after changing the plugin or its settings.
 
----
+## Ollama configuration
 
-## Configuration
+By default, the plugin reuses Hermes' configured Ollama provider URL and credentials through Hermes' Ollama configuration helpers. It removes an OpenAI-compatible `/v1` suffix and calls the native Ollama `/api/embed` endpoint, which supports per-request CPU options.
 
-All configuration is optional and can be set in your `.env` or process environment:
+The default model is `qwen3-embedding:latest`. Override it in Hermes' `~/.hermes/.env` if desired:
+
+```dotenv
+SMART_FILTER_OLLAMA_MODEL=qwen3-embedding:latest
+SMART_FILTER_THREADS=1
+```
+
+Optional connection overrides are available when the existing provider configuration cannot be reused:
+
+```dotenv
+SMART_FILTER_OLLAMA_BASE_URL=http://ollama-host:11434
+SMART_FILTER_OLLAMA_API_KEY=...
+```
+
+Use the native Ollama API root for `SMART_FILTER_OLLAMA_BASE_URL` (not a URL ending in `/v1`). The API-key override is optional; by default the plugin reuses the credential resolved by Hermes. Never put a real key in the repository or logs.
+
+The old FastEmbed variable `SMART_FILTER_MODEL` is not used by the Ollama backend; set `SMART_FILTER_OLLAMA_MODEL` instead. This prevents a former value such as `BAAI/bge-small-en-v1.5` from being sent to Ollama as though it were an Ollama model.
+
+### CPU and batching controls
 
 | Variable | Default | Description |
-| :--- | :--- | :--- |
-| `SMART_FILTER_MODEL` | `BAAI/bge-small-en-v1.5` | FastEmbed ONNX embedding model name. |
-| `SMART_FILTER_MIN_SCORE` | `0.25` | Minimum cosine similarity threshold for vector matches in `tool_search`. |
-| `SMART_FILTER_MAX_K` | `8` | Default maximum tool candidates returned per query. |
-| `SMART_FILTER_MIN_K` | `1` | Lower bound for requested search candidates. |
-| `SMART_FILTER_DEBUG` | `false` | Enable verbose debug logging (`true`/`false`). |
-| `SMART_FILTER_THREADS` | `1` | ONNX intra-op threads for the FastEmbed model. |
-| `SMART_FILTER_PRE_LLM_ENABLED` | `true` | Enable proactive `pre_llm_call` contextual tool injection. |
-| `SMART_FILTER_PRE_LLM_MIN_SCORE` | `0.55` | Relevance score threshold for injecting tools directly into turn context. |
-| `SMART_FILTER_PRE_LLM_MAX_TOOLS` | `4` | Maximum number of candidate tools injected per turn. |
-| `SMART_FILTER_LIVE_RBAC_DISCOVERY` | `false` | If `true`, queries live `tools/list` on `agentgateway` with the user's `X-User-Groups` headers (cached with 60s TTL) to reflect dynamic RBAC rules directly. |
+| --- | --- | --- |
+| `SMART_FILTER_OLLAMA_MODEL` | `qwen3-embedding:latest` | Ollama embedding model; use an embedding model, not the chat model |
+| `SMART_FILTER_THREADS` | `1` | CPU threads sent to Ollama with each embedding request |
+| `SMART_FILTER_OLLAMA_BATCH_SIZE` | `64` | Number of tool descriptions embedded per request |
+| `SMART_FILTER_OLLAMA_TIMEOUT` | `30` | HTTP timeout in seconds |
+| `SMART_FILTER_OLLAMA_KEEP_ALIVE` | `5m` | Ollama model keep-alive after embedding |
+| `SMART_FILTER_MAX_K` | `8` | Default maximum candidate tools per query |
+| `SMART_FILTER_MIN_K` | `1` | Lower bound for requested candidates |
+| `SMART_FILTER_MIN_SCORE` | `0.25` | Minimum cosine similarity for a result |
+| `SMART_FILTER_PRE_LLM_ENABLED` | `true` | Inject relevant tools before the LLM call |
+| `SMART_FILTER_PRE_LLM_MIN_SCORE` | `0.55` | Minimum score for pre-LLM injection |
+| `SMART_FILTER_PRE_LLM_MAX_TOOLS` | `4` | Maximum tools injected by the pre-LLM hook |
+| `SMART_FILTER_LIVE_RBAC_DISCOVERY` | `false` | Query Agentgateway live with the caller's identity headers |
 
----
+Ollama's native `/api/embed` request accepts `options.num_gpu` and `options.num_thread`; the plugin requests `num_gpu: 0` and uses `SMART_FILTER_THREADS`. This is per embedding request and does not change GPU settings for Hermes chat inference. The first catalog indexing can take longer; subsequent searches reuse its in-memory vectors until the model or tool catalog changes.
 
-## Proactive Tool Routing (`pre_llm_call`) & Dynamic RBAC
+The embedding request sends tool names/descriptions and search queries to the configured Ollama endpoint. Whether that traffic stays on the local network depends on the URL and reverse-proxy routing configured for that provider.
 
-When using large MCP setups, models often suffer from bias toward tools that fit into the visible prompt manifest, ignoring hundreds of deferred tools.
+## Search and fallback behavior
 
-`mcp-smart-filter` solves this on two levels:
-1. **Bridge Intercept:** Overrides native `tools.tool_search` to guarantee high-accuracy FastEmbed semantic retrieval instead of lexical BM25 misses.
-2. **Proactive `pre_llm_call` Routing:** Evaluates the user's message before the LLM generates a response, semantically discovers the top matching MCP tools, and injects their signatures directly into the user turn's context.
-3. **Live RBAC Awareness (`SMART_FILTER_LIVE_RBAC_DISCOVERY=true`):** When enabled, tool discovery queries the gateway at runtime using the caller's identity headers (`X-On-Behalf-Of` / `X-User-Groups`). Users only see and receive tools their groups are authorized for (e.g. `it-admin` vs. `vorstand`), maintaining zero configuration drift with gateway security policies.
+1. The plugin obtains the current tool catalog from Hermes, the PluginContext, or the MCP schema cache.
+2. Tool descriptions are embedded in batches and cached by model plus catalog fingerprint.
+3. Each search query is embedded with the same model; normalized dot products rank the candidates.
+4. If configuration, connectivity, model lookup, or embedding fails, the plugin uses its keyword fallback and logs the failure type/HTTP status without logging credentials.
 
----
+The `pre_llm_call` hook uses the same engine to surface a few likely MCP tools before generation. Live RBAC discovery remains optional and continues to use `X-User-Groups` when enabled.
 
----
+## Tests
 
-## Running Tests
-
-The test suite validates schema compatibility, tool extraction, vector caching, limit clamping, and 1,000-tool catalog scaling:
+Run from this directory:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+Tests use a mocked Ollama HTTP client; they do not require a running model server or download model weights.
 
 ## Diagnostics
 
 The plugin writes an audit log to `~/.hermes/mcp_smart_filter.log`:
 
 - `[PLUGIN LOADED]` — registration outcome (native override vs. fallback)
-- `[TOOL_SEARCH OVERRIDE EXECUTED]` — every search with queries, limit, catalog size, and matched tool names
+- `[TOOL_SEARCH OVERRIDE EXECUTED]` — query count, candidate count, engines used, and matches
+- `[PRE-WARM]` — background catalog warm-up status
 
-## Troubleshooting
-
-**Plugin registers as `semantic_tool_search` instead of overriding `tool_search`**
-
-The `tools.override` capability was not granted. Re-enable with consent:
-
-```bash
-hermes plugins enable mcp-smart-filter --allow-tool-override
-```
-
-**Searches always use `keyword_fallback` engine**
-
-The `fastembed` package is not installed in Hermes' Python environment:
-
-```bash
-pip install "fastembed>=0.3.0,<1"
-```
-
-**Plugin does not appear in `hermes plugins list`**
-
-Run discovery diagnostics:
-
-```bash
-HERMES_PLUGINS_DEBUG=1 hermes plugins list
-```
-
----
-
-## License
-
-MIT
+If every search reports `keyword_fallback`, check that Hermes can resolve the Ollama provider, that its endpoint exposes native `/api/embed`, and that the configured embedding model is installed and available to that endpoint.

@@ -1,4 +1,4 @@
-"""Tool schemas for the FastEmbed tool search plugin."""
+"""Tool schemas for the Ollama semantic tool search plugin."""
 
 TOOL_SEARCH_SCHEMA = {
     "name": "tool_search",

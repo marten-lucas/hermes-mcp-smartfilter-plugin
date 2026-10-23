@@ -1,12 +1,11 @@
 name: mcp-smart-filter
-version: 2.4.5
+version: 2.5.0
 manifest_version: 1
 api_version: 1
 
 description: >
-  Provides in-process FastEmbed semantic vector search for Hermes Agent
-  tool discovery and pre_llm_call smart tool routing, replacing built-in BM25
-  tool_search for large toolsets (1000+).
+  Uses the configured Ollama embedding provider for semantic Hermes tool discovery
+  and pre_llm_call routing, replacing lexical BM25 search for large toolsets (1000+).
 
 author: Marten Lucas
 homepage: https://github.com/marten-lucas/hermes-mcp-smartfilter-plugin
@@ -16,7 +15,7 @@ tags:
   - mcp
   - tool-search
   - vector-search
-  - fastembed
+  - ollama-embeddings
   - smart-routing
 
 kind: standalone
@@ -27,9 +26,36 @@ capabilities:
 hooks:
   - pre_llm_call
 
-python_dependencies:
-  - "fastembed>=0.3.0,<1"
-  - "numpy>=1.20.0,<3"
+
+optional_env:
+  - name: SMART_FILTER_OLLAMA_MODEL
+    description: "Ollama embedding model (default: qwen3-embedding:latest)"
+    prompt: "Ollama embedding model"
+    password: false
+  - name: SMART_FILTER_OLLAMA_BASE_URL
+    description: "Optional native Ollama API root override; otherwise Hermes provider configuration is reused"
+    prompt: "Ollama API base URL override"
+    password: false
+  - name: SMART_FILTER_OLLAMA_API_KEY
+    description: "Optional API key override for the Ollama endpoint"
+    prompt: "Ollama API key override"
+    password: true
+  - name: SMART_FILTER_THREADS
+    description: "CPU threads for embedding requests (default: 1)"
+    prompt: "Embedding CPU threads"
+    password: false
+  - name: SMART_FILTER_OLLAMA_BATCH_SIZE
+    description: "Number of tool descriptions embedded per Ollama request (default: 64)"
+    prompt: "Ollama embedding batch size"
+    password: false
+  - name: SMART_FILTER_OLLAMA_TIMEOUT
+    description: "Ollama request timeout in seconds (default: 30)"
+    prompt: "Ollama embedding timeout"
+    password: false
+  - name: SMART_FILTER_OLLAMA_KEEP_ALIVE
+    description: "How long Ollama keeps the embedding model loaded (default: 5m)"
+    prompt: "Ollama embedding keep-alive"
+    password: false
 
 requires_env: []
 
