@@ -78,6 +78,8 @@ The embedding request sends tool names/descriptions and search queries to the co
 
 The `pre_llm_call` hook uses the same engine to surface a few likely MCP tools before generation. Live RBAC discovery remains optional and continues to use `X-User-Groups` when enabled.
 
+When AgentGateway is split into multiple MCP routes, name the Hermes server entries `agentgateway_<route>` (for example `agentgateway_infra`, `agentgateway_kita`, and `agentgateway_home`). The plugin queries each matching entry independently, prefixes tools with the corresponding Hermes server name, and keeps results from healthy routes if another route is unavailable. Direct MCP servers such as `coolify` are not included. The legacy single `agentgateway` entry remains supported.
+
 ## Tests
 
 Run from this directory:

@@ -37,4 +37,3 @@ SEMANTIC_TOOL_SEARCH = {
     **TOOL_SEARCH_SCHEMA,
     "name": "semantic_tool_search",
 }
-

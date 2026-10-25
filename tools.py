@@ -23,13 +23,16 @@ def _write_audit_log(message: str) -> None:
     """Write guaranteed audit log entry to ~/.hermes/mcp_smart_filter.log."""
     try:
         import datetime
+
         os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S %Z"
+        )
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"[{timestamp}] {message}\n")
             f.flush()
-    except Exception:
-        pass
+    except OSError:
+        logger.debug("[Smart-Filter] Could not write audit log", exc_info=True)
 
 
 def _sanitize_mcp_name_component(value: str) -> str:
@@ -42,8 +45,9 @@ def _sanitize_mcp_name_component(value: str) -> str:
     """
     try:
         from tools.mcp_tool_schema import sanitize_mcp_name_component as _core_sanitize
+
         return _core_sanitize(value)
-    except Exception:
+    except ImportError:
         return re.sub(r"[^A-Za-z0-9_]", "_", str(value or ""))
 
 
@@ -54,8 +58,9 @@ def _make_mcp_name(server: str, tool: str) -> str:
     """
     try:
         from tools.mcp_tool_schema import mcp_prefixed_tool_name as _core_prefix
+
         return _core_prefix(server, tool)
-    except Exception:
+    except ImportError:
         return f"mcp__{_sanitize_mcp_name_component(server)}__{_sanitize_mcp_name_component(tool)}"
 
 
@@ -131,7 +136,9 @@ def _get_available_tools(ctx: Any, kwargs: dict[str, Any]) -> list[Any]:
                 if result:
                     return list(result)
             except Exception:
-                logger.exception("[Smart-Filter] Failed to read tools from ctx._manager")
+                logger.exception(
+                    "[Smart-Filter] Failed to read tools from ctx._manager"
+                )
 
     get_tools = getattr(ctx, "get_tools", None)
     if callable(get_tools):
@@ -150,16 +157,21 @@ def _get_available_tools(ctx: Any, kwargs: dict[str, Any]) -> list[Any]:
 
     try:
         from tools.registry import registry
+
         for name, entry in getattr(registry, "_tools", {}).items():
             if name not in seen:
                 seen.add(name)
-                cached_tools.append({
-                    "name": name,
-                    "description": getattr(entry, "description", "") or "",
-                    "parameters": [],
-                })
-    except Exception:
-        pass
+                cached_tools.append(
+                    {
+                        "name": name,
+                        "description": getattr(entry, "description", "") or "",
+                        "parameters": [],
+                    }
+                )
+    except ImportError as exc:
+        logger.debug(
+            "[Smart-Filter] Hermes ToolRegistry unavailable: %s", type(exc).__name__
+        )
 
     cache_path = os.path.expanduser("~/.hermes/cache/mcp_schema_cache.json")
     if os.path.exists(cache_path):
@@ -171,13 +183,21 @@ def _get_available_tools(ctx: Any, kwargs: dict[str, Any]) -> list[Any]:
                     tool_name = _make_mcp_name(server_name, t["name"])
                     if tool_name not in seen:
                         seen.add(tool_name)
-                        cached_tools.append({
-                            "name": tool_name,
-                            "description": t.get("description") or "",
-                            "parameters": list(t.get("inputSchema", {}).get("properties", {}).keys()),
-                        })
-        except Exception:
-            pass
+                        cached_tools.append(
+                            {
+                                "name": tool_name,
+                                "description": t.get("description") or "",
+                                "parameters": list(
+                                    t.get("inputSchema", {})
+                                    .get("properties", {})
+                                    .keys()
+                                ),
+                            }
+                        )
+        except (OSError, ValueError, AttributeError, TypeError, KeyError) as exc:
+            logger.debug(
+                "[Smart-Filter] MCP schema cache unavailable: %s", type(exc).__name__
+            )
 
     return cached_tools
 
@@ -186,64 +206,107 @@ _LIVE_TOOLS_CACHE: dict[tuple[str, str], tuple[list[dict[str, Any]], float]] = {
 _LIVE_CACHE_LOCK = threading.Lock()
 
 
-def _fetch_live_mcp_tools(groups: str = "", timeout: float = 12.0, ttl: float = 60.0) -> list[dict[str, Any]]:
+def _configured_gateway_servers(
+    mcp_servers: dict[str, Any],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Select AgentGateway MCP entries, while leaving unrelated MCP servers alone."""
+    selected = [
+        (name, config)
+        for name, config in mcp_servers.items()
+        if name == "agentgateway" or name.startswith("agentgateway_")
+    ]
+    if selected:
+        return selected
+    return [("agentgateway", {"url": "https://mcp.cloud.kiga-gramschatz.de/mcp"})]
+
+
+def _parse_mcp_tools(response: Any) -> list[dict[str, Any]]:
+    response.raise_for_status()
+    for line in response.text.splitlines():
+        if line.startswith("data: "):
+            data = json.loads(line[6:])
+            return data.get("result", {}).get("tools", [])
+    try:
+        return response.json().get("result", {}).get("tools", [])
+    except (AttributeError, ValueError):
+        return []
+
+
+def _fetch_live_mcp_tools(
+    groups: str = "", timeout: float = 12.0, ttl: float = 60.0
+) -> list[dict[str, Any]]:
+    """Fetch the authorized live catalog from configured AgentGateway routes.
+
+    The legacy ``agentgateway`` entry remains supported. Split gateways use
+    ``agentgateway_<route>`` names; direct MCP servers (for example Coolify)
+    are deliberately not included. Cache entries are scoped to routes and groups.
     """
-    Query configured MCP servers (specifically agentgateway) with the caller's
-    X-User-Groups / X-On-Behalf-Of headers to obtain the exact list of tools
-    authorized by the gateway at runtime. Results are cached in-memory per group
-    string with a configurable TTL.
-    """
-    import time
     now = time.time()
-    cache_key = ("agentgateway", groups)
-
-    with _LIVE_CACHE_LOCK:
-        if cache_key in _LIVE_TOOLS_CACHE:
-            cached_tools, timestamp = _LIVE_TOOLS_CACHE[cache_key]
-            if now - timestamp < ttl:
-                return cached_tools
-
-    # Find agentgateway config
-    endpoint = ""
-    auth_header = ""
     try:
         from hermes_cli.config import load_config
+
         cfg = load_config() or {}
         mcp_servers = cfg.get("mcp_servers") or {}
-        ag_cfg = mcp_servers.get("agentgateway") or {}
-        endpoint = ag_cfg.get("url") or ""
-        headers_cfg = ag_cfg.get("headers") or {}
-        auth_header = headers_cfg.get("Authorization") or ""
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - Hermes config is optional to standalone plugin use
+        logger.debug(
+            "[Smart-Filter] Hermes MCP config unavailable: %s", type(exc).__name__
+        )
+        mcp_servers = {}
 
-    # Fallback to env file if auth token has template string
-    if not auth_header or "${" in auth_header:
-        token = os.environ.get("AGENTGATEWAY_BEARER_TOKEN", "")
-        if not token:
-            env_path = os.path.expanduser("~/.hermes/.env")
-            if os.path.exists(env_path):
-                try:
-                    with open(env_path, "r", encoding="utf-8") as f:
-                        for line in f:
-                            if "AGENTGATEWAY_BEARER_TOKEN" in line:
-                                token = line.split("=", 1)[1].strip().strip('"').strip("'")
-                                break
-                except Exception:
-                    pass
-        if token:
-            auth_header = f"Bearer {token}"
+    servers = _configured_gateway_servers(mcp_servers)
+    server_key = "|".join(f"{name}={entry.get('url', '')}" for name, entry in servers)
+    cache_key = (server_key, groups)
+    with _LIVE_CACHE_LOCK:
+        cached = _LIVE_TOOLS_CACHE.get(cache_key)
+        if cached and now - cached[1] < ttl:
+            return cached[0]
 
-    if not endpoint:
-        endpoint = "https://mcp.cloud.kiga-gramschatz.de/mcp"
-
-    if not auth_header:
-        logger.warning("[Smart-Filter] Cannot perform live MCP discovery: missing Authorization token.")
+    token = os.environ.get("AGENTGATEWAY_BEARER_TOKEN", "")
+    if not token:
+        env_path = os.path.expanduser("~/.hermes/.env")
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("AGENTGATEWAY_BEARER_TOKEN="):
+                            token = line.split("=", 1)[1].strip().strip('"').strip("'")
+                            break
+            except OSError:
+                pass
+    if not token:
+        logger.warning(
+            "[Smart-Filter] Cannot perform live MCP discovery: missing AgentGateway token."
+        )
         return []
 
     try:
         import httpx
+    except ImportError as exc:
+        logger.error(
+            "[Smart-Filter] HTTP client unavailable for live MCP discovery: %s", exc
+        )
+        return []
 
+    tools: list[dict[str, Any]] = []
+    successful_routes: list[str] = []
+    for server_name, server_config in servers:
+        endpoint = server_config.get("url") or ""
+        if not endpoint:
+            logger.warning(
+                "[Smart-Filter] AgentGateway entry %s has no URL.", server_name
+            )
+            continue
+        configured_headers = server_config.get("headers") or {}
+        auth_header = next(
+            (
+                value
+                for key, value in configured_headers.items()
+                if key.lower() == "authorization"
+            ),
+            "",
+        )
+        if not auth_header or "${" in auth_header:
+            auth_header = f"Bearer {token}"
         headers = {
             "Authorization": auth_header,
             "Content-Type": "application/json",
@@ -252,76 +315,93 @@ def _fetch_live_mcp_tools(groups: str = "", timeout: float = 12.0, ttl: float = 
         if groups:
             headers["X-User-Groups"] = groups
 
-        with httpx.Client(headers=headers, timeout=timeout) as client:
-            # 1. Initialize session
-            r_init = client.post(
-                endpoint,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {},
-                        "clientInfo": {"name": "hermes-smart-filter", "version": "2.3"},
+        try:
+            with httpx.Client(headers=headers, timeout=timeout) as client:
+                r_init = client.post(
+                    endpoint,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {},
+                            "clientInfo": {
+                                "name": "hermes-smart-filter",
+                                "version": "2.6",
+                            },
+                        },
                     },
-                },
-            )
-            session_id = r_init.headers.get("mcp-session-id")
-            if not session_id:
-                logger.warning("[Smart-Filter] Live MCP discovery initialize returned no session ID.")
-                return []
+                )
+                r_init.raise_for_status()
+                session_id = r_init.headers.get("mcp-session-id")
+                if not session_id:
+                    logger.warning(
+                        "[Smart-Filter] %s initialize returned no MCP session ID.",
+                        server_name,
+                    )
+                    continue
+                client.headers["mcp-session-id"] = session_id
+                client.post(
+                    endpoint,
+                    json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+                )
+                r_list = client.post(
+                    endpoint,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/list",
+                        "params": {},
+                    },
+                )
+                raw_tools = _parse_mcp_tools(r_list)
 
-            client.headers["mcp-session-id"] = session_id
-
-            # 2. tools/list
-            r_list = client.post(
-                endpoint,
-                json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-            )
-
-        tools: list[dict[str, Any]] = []
-        for line in r_list.text.splitlines():
-            if line.startswith("data: "):
-                data = json.loads(line[6:])
-                raw_tools = data.get("result", {}).get("tools", [])
-                for t in raw_tools:
-                    name = t.get("name", "")
-                    if name.startswith("mcp__"):
-                        # Already registry-form: normalize every component anyway
-                        parts = name.split("__", 2)
-                        if len(parts) == 3:
-                            tool_name = _make_mcp_name(parts[1], parts[2])
-                        else:
-                            tool_name = name
-                    else:
-                        tool_name = _make_mcp_name("agentgateway", name)
-                    desc = t.get("description") or ""
-                    params = list(t.get("inputSchema", {}).get("properties", {}).keys())
-                    tools.append({
+            for raw_tool in raw_tools:
+                name = str(raw_tool.get("name", ""))
+                if name.startswith("mcp__"):
+                    parts = name.split("__", 2)
+                    tool_name = (
+                        _make_mcp_name(parts[1], parts[2]) if len(parts) == 3 else name
+                    )
+                else:
+                    tool_name = _make_mcp_name(server_name, name)
+                desc = raw_tool.get("description") or ""
+                params = list(
+                    (raw_tool.get("inputSchema") or {}).get("properties", {}).keys()
+                )
+                tools.append(
+                    {
                         "name": tool_name,
                         "description": desc,
                         "parameters": params,
-                        "search_text": f"{tool_name} - {desc}" + (f" - parameters: {', '.join(params)}" if params else ""),
-                    })
-                break
+                        "search_text": f"{tool_name} - {desc}"
+                        + (f" - parameters: {', '.join(params)}" if params else ""),
+                    }
+                )
+            successful_routes.append(server_name)
+        except Exception as exc:  # noqa: BLE001 - one failed gateway route must not hide the others
+            logger.error(
+                "[Smart-Filter] Failed to query AgentGateway route %s (%s): %s",
+                server_name,
+                endpoint,
+                exc,
+            )
 
-        with _LIVE_CACHE_LOCK:
-            _LIVE_TOOLS_CACHE[cache_key] = (tools, now)
+    with _LIVE_CACHE_LOCK:
+        _LIVE_TOOLS_CACHE[cache_key] = (tools, now)
 
-        logger.info(
-            "[Smart-Filter] Live MCP discovery: retrieved %d tools for groups=%r (TTL=%.0fs)",
-            len(tools),
-            groups,
-            ttl,
-        )
-        _write_audit_log(
-            f"[LIVE MCP DISCOVERY] groups={groups!r} -> fetched {len(tools)} authorized tools from {endpoint}"
-        )
-        return tools
-    except Exception as exc:
-        logger.error("[Smart-Filter] Failed to query live MCP tools from %s: %s", endpoint, exc)
-        return []
+    logger.info(
+        "[Smart-Filter] Live MCP discovery: retrieved %d tools from routes=%s for groups=%r (TTL=%.0fs)",
+        len(tools),
+        ",".join(successful_routes),
+        groups,
+        ttl,
+    )
+    _write_audit_log(
+        f"[LIVE MCP DISCOVERY] groups={groups!r} -> fetched {len(tools)} authorized tools from routes={','.join(successful_routes)}"
+    )
+    return tools
 
 
 def _normalize_ollama_root(base_url: str) -> str:
@@ -338,7 +418,7 @@ def _normalize_ollama_root(base_url: str) -> str:
     path = parsed.path.rstrip("/")
     for suffix in ("/api/tags", "/v1/models", "/api", "/v1"):
         if path.endswith(suffix):
-            path = path[:-len(suffix)].rstrip("/")
+            path = path[: -len(suffix)].rstrip("/")
             break
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
 
@@ -352,8 +432,10 @@ def _secret_from_hermes(key_env: str) -> str:
         value = get_secret_str(key_env, "")
         if value:
             return str(value).strip()
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - fall back to the process environment if secret resolution fails
+        logger.debug(
+            "[Smart-Filter] Hermes secret resolution failed: %s", type(exc).__name__
+        )
     return os.environ.get(key_env, "").strip()
 
 
@@ -366,8 +448,10 @@ def _resolve_ollama_connection() -> tuple[str, dict[str, str]]:
         from hermes_cli.config import load_config
 
         config = load_config() or {}
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - standalone mode may not have Hermes config available
+        logger.debug(
+            "[Smart-Filter] Hermes model config unavailable: %s", type(exc).__name__
+        )
 
     ollama_entry: dict[str, Any] = {}
     providers = config.get("providers") or {}
@@ -378,7 +462,8 @@ def _resolve_ollama_connection() -> tuple[str, dict[str, str]]:
         if isinstance(custom_providers, list):
             ollama_entry = next(
                 (
-                    entry for entry in custom_providers
+                    entry
+                    for entry in custom_providers
                     if isinstance(entry, dict)
                     and str(entry.get("name", "")).strip().lower() == "ollama"
                 ),
@@ -390,25 +475,40 @@ def _resolve_ollama_connection() -> tuple[str, dict[str, str]]:
         model_config = {}
     base_url = (
         explicit_url
-        or str(ollama_entry.get("base_url") or ollama_entry.get("api") or ollama_entry.get("url") or "").strip()
+        or str(
+            ollama_entry.get("base_url")
+            or ollama_entry.get("api")
+            or ollama_entry.get("url")
+            or ""
+        ).strip()
         or str(model_config.get("base_url") or "").strip()
     )
 
     raw_headers = ollama_entry.get("extra_headers") or ollama_entry.get("headers") or {}
-    headers = {
-        str(name): str(value)
-        for name, value in raw_headers.items()
-    } if isinstance(raw_headers, dict) else {}
+    headers = (
+        {str(name): str(value) for name, value in raw_headers.items()}
+        if isinstance(raw_headers, dict)
+        else {}
+    )
 
-    api_key = explicit_key or str(ollama_entry.get("api_key") or model_config.get("api_key") or "").strip()
-    key_env = str(ollama_entry.get("key_env") or ollama_entry.get("api_key_env") or "").strip()
+    api_key = (
+        explicit_key
+        or str(ollama_entry.get("api_key") or model_config.get("api_key") or "").strip()
+    )
+    key_env = str(
+        ollama_entry.get("key_env") or ollama_entry.get("api_key_env") or ""
+    ).strip()
     if not explicit_key and key_env:
         api_key = _secret_from_hermes(key_env) or api_key
     if api_key.startswith("${") and api_key.endswith("}"):
         api_key = _secret_from_hermes(api_key[2:-1])
 
     if api_key:
-        headers = {name: value for name, value in headers.items() if name.lower() != "authorization"}
+        headers = {
+            name: value
+            for name, value in headers.items()
+            if name.lower() != "authorization"
+        }
         headers["Authorization"] = f"Bearer {api_key}"
     elif not any(name.lower() == "authorization" for name in headers):
         api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
@@ -420,8 +520,11 @@ def _resolve_ollama_connection() -> tuple[str, dict[str, str]]:
             from hermes_cli.models_local import _get_ollama_base_url
 
             base_url = _get_ollama_base_url()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - continue to environment-based endpoint fallbacks
+            logger.debug(
+                "[Smart-Filter] Hermes Ollama endpoint unavailable: %s",
+                type(exc).__name__,
+            )
     if not base_url:
         base_url = (
             os.environ.get("OLLAMA_BASE_URL", "").strip()
@@ -466,9 +569,13 @@ class OllamaSearchEngine:
         self._retry_after = 0.0
         self._cache_lock = threading.Lock()
         self._build_lock = threading.Lock()
-        self._cache: tuple[str, list[dict[str, Any]], list[tuple[float, ...]]] | None = None
+        self._cache: (
+            tuple[str, list[dict[str, Any]], list[tuple[float, ...]]] | None
+        ) = None
 
-        if os.environ.get("SMART_FILTER_MODEL") and not os.environ.get("SMART_FILTER_OLLAMA_MODEL"):
+        if os.environ.get("SMART_FILTER_MODEL") and not os.environ.get(
+            "SMART_FILTER_OLLAMA_MODEL"
+        ):
             logger.info(
                 "[Smart-Filter] Ignoring legacy SMART_FILTER_MODEL for Ollama; "
                 "use SMART_FILTER_OLLAMA_MODEL to select the embedding model."
@@ -503,7 +610,7 @@ class OllamaSearchEngine:
                 urlsplit(self._connection[0]).hostname or "unknown",
             )
             return True
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - provider failures must activate keyword fallback
             self._record_failure(exc)
             return False
 
@@ -536,7 +643,7 @@ class OllamaSearchEngine:
         vectors: list[tuple[float, ...]] = []
         with self._client() as client:
             for start in range(0, len(texts), self.batch_size):
-                batch = texts[start:start + self.batch_size]
+                batch = texts[start : start + self.batch_size]
                 payload: dict[str, Any] = {
                     "model": self.model_name,
                     "input": batch,
@@ -547,7 +654,9 @@ class OllamaSearchEngine:
                 response = client.post(endpoint, headers=headers, json=payload)
                 response.raise_for_status()
                 result = response.json()
-                embeddings = result.get("embeddings") if isinstance(result, dict) else None
+                embeddings = (
+                    result.get("embeddings") if isinstance(result, dict) else None
+                )
                 if not isinstance(embeddings, list) or len(embeddings) != len(batch):
                     raise ValueError("Ollama returned an unexpected embedding response")
                 vectors.extend(self._normalize_vector(vector) for vector in embeddings)
@@ -597,9 +706,13 @@ class OllamaSearchEngine:
             try:
                 vectors = self._embed_texts([tool["search_text"] for tool in tools])
                 if len(vectors) != len(tools):
-                    raise ValueError("Ollama returned an incomplete tool catalog embedding")
+                    raise ValueError(
+                        "Ollama returned an incomplete tool catalog embedding"
+                    )
                 if len({len(vector) for vector in vectors}) != 1:
-                    raise ValueError("Ollama returned inconsistent embedding dimensions")
+                    raise ValueError(
+                        "Ollama returned inconsistent embedding dimensions"
+                    )
                 with self._cache_lock:
                     self._cache = (fingerprint, tools, vectors)
                 logger.info(
@@ -610,7 +723,7 @@ class OllamaSearchEngine:
                     fingerprint[-8:],
                 )
                 return True
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - embedding failures must activate keyword fallback
                 self._record_failure(exc)
                 return False
 
@@ -635,7 +748,9 @@ class OllamaSearchEngine:
                 return self._keyword_search(query_text, tools, limit=limit)
             _, cached_tools, cached_vectors = snapshot
             if len(query_vector) != len(cached_vectors[0]):
-                raise ValueError("Ollama query and catalog embedding dimensions do not match")
+                raise ValueError(
+                    "Ollama query and catalog embedding dimensions do not match"
+                )
 
             ranked = sorted(
                 (
@@ -653,11 +768,10 @@ class OllamaSearchEngine:
                     break
             if matches:
                 return matches
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - query embedding failures use keyword fallback
             self._record_failure(exc)
 
         return self._keyword_search(query_text, tools, limit=limit)
-
 
     @staticmethod
     def _keyword_search(
@@ -740,9 +854,7 @@ def create_handler(ctx: Any):
         if isinstance(raw_queries, str):
             queries = [raw_queries.strip()]
         elif isinstance(raw_queries, list):
-            queries = [
-                str(q).strip() for q in raw_queries if str(q).strip()
-            ]
+            queries = [str(q).strip() for q in raw_queries if str(q).strip()]
         else:
             # Backward compatibility with single "query"
             raw_query = args.get("query")
@@ -814,13 +926,18 @@ def create_handler(ctx: Any):
                         "source": "mcp" if name.startswith("mcp__") else "plugin",
                         "source_name": name.split("__")[1] if "__" in name else "",
                         "description": tool_info["description"][:400],
-                        "required": [p for p in tool_info.get("parameters", []) if isinstance(p, str)][:32],
+                        "required": [
+                            p
+                            for p in tool_info.get("parameters", [])
+                            if isinstance(p, str)
+                        ][:32],
                         "score": round(score, 3),
                         "search_method": method,
                     }
 
             if debug_mode:
                 import sys
+
                 print(
                     f"\n[Smart-Filter] Query: {q!r} -> {len(matched_names)} matches (engine={used_method})",
                     file=sys.stderr,
@@ -861,10 +978,19 @@ def create_pre_llm_hook(ctx: Any):
     """
     min_score = float(os.environ.get("SMART_FILTER_PRE_LLM_MIN_SCORE", "0.55"))
     max_tools = int(os.environ.get("SMART_FILTER_PRE_LLM_MAX_TOOLS", "4"))
-    enabled = os.environ.get("SMART_FILTER_PRE_LLM_ENABLED", "true").lower() in {"true", "1", "yes", "on"}
-    live_rbac_discovery = os.environ.get("SMART_FILTER_LIVE_RBAC_DISCOVERY", "false").lower() in {"true", "1", "yes", "on"}
+    enabled = os.environ.get("SMART_FILTER_PRE_LLM_ENABLED", "true").lower() in {
+        "true",
+        "1",
+        "yes",
+        "on",
+    }
+    live_rbac_discovery = os.environ.get(
+        "SMART_FILTER_LIVE_RBAC_DISCOVERY", "false"
+    ).lower() in {"true", "1", "yes", "on"}
 
-    def on_pre_llm_call(user_message: Any = None, **kwargs: Any) -> dict[str, str] | None:
+    def on_pre_llm_call(
+        user_message: Any = None, **kwargs: Any
+    ) -> dict[str, str] | None:
         if not enabled:
             return None
 
@@ -873,16 +999,20 @@ def create_pre_llm_hook(ctx: Any):
         if isinstance(user_message, str):
             text = user_message.strip()
         elif isinstance(user_message, dict):
-            text = str(user_message.get("content") or user_message.get("text") or "").strip()
+            text = str(
+                user_message.get("content") or user_message.get("text") or ""
+            ).strip()
 
         # Clean off prepended [System note: ...] headers (e.g. session-reset notices from Hermes/Talk)
-        text = re.sub(r"^\[System note:[^\]]+\]\s*", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+        text = re.sub(
+            r"^\[System note:[^\]]+\]\s*", "", text, flags=re.DOTALL | re.IGNORECASE
+        ).strip()
 
         if not text or len(text) < 5:
             return None
 
         # Ignore slash commands or isolated system signals
-        if text.startswith("/") or text.startswith('"/') or text.startswith("[System note:"):
+        if text.startswith(("/", '"/', "[System note:")):
             return None
 
         # Resolve current user groups via hermes-x-on-behalf if available
@@ -903,7 +1033,7 @@ def create_pre_llm_hook(ctx: Any):
                 if mod is None:
                     try:
                         mod = importlib.import_module(module_name)
-                    except Exception:
+                    except ImportError:
                         mod = None
                 get_p = getattr(mod, "get_principal", None) if mod else None
                 if callable(get_p):
@@ -911,18 +1041,18 @@ def create_pre_llm_hook(ctx: Any):
             p = get_p() if callable(get_p) else None
             if p and getattr(p, "groups", None):
                 user_groups = ",".join(sorted(p.groups))
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - identity plugin failures use the documented fallback
+            logger.debug(
+                "[Smart-Filter] Could not resolve principal groups: %s",
+                type(exc).__name__,
+            )
 
         # Fallback for user identity from turn arguments or session
         if not user_groups:
             sender_id = str(kwargs.get("sender_id") or "").strip().lower()
             if not sender_id:
-                try:
-                    meta = kwargs.get("session_metadata") or {}
-                    sender_id = str(meta.get("user_id") or "").strip().lower()
-                except Exception:
-                    pass
+                meta = kwargs.get("session_metadata") or {}
+                sender_id = str(meta.get("user_id") or "").strip().lower()
 
             # Known role mappings from x_on_behalf config
             if sender_id in ("vorstand", "admin"):
@@ -947,7 +1077,9 @@ def create_pre_llm_hook(ctx: Any):
         if not extracted:
             return None
 
-        matches = _ENGINE.search(query=text, tools=extracted, limit=max_tools, min_score=min_score)
+        matches = _ENGINE.search(
+            query=text, tools=extracted, limit=max_tools, min_score=min_score
+        )
         if not matches:
             return None
 
@@ -960,9 +1092,13 @@ def create_pre_llm_hook(ctx: Any):
             name = tool_info["name"]
             matched_names.append(name)
             desc = (tool_info.get("description") or "").split("\n")[0].strip()[:140]
-            lines.append(f"- Tool: `{name}` — {desc} -> Call via: `tool_call(name=\"{name}\", arguments={{...}})`")
+            lines.append(
+                f'- Tool: `{name}` — {desc} -> Call via: `tool_call(name="{name}", arguments={{...}})`'
+            )
 
-        lines.append("\nDo NOT attempt curl or manual credentials prompts when one of the above specialized tools is listed.")
+        lines.append(
+            "\nDo NOT attempt curl or manual credentials prompts when one of the above specialized tools is listed."
+        )
 
         _write_audit_log(
             f"[PRE_LLM_CALL ROUTING] query={text!r} -> matched {len(matched_names)} tools (engine={matches[0][2]}): {matched_names}"

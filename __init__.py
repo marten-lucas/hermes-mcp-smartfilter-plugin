@@ -15,7 +15,7 @@ except (ImportError, ValueError):
 
 logger = logging.getLogger("hermes.plugins.mcp_smart_filter")
 
-__version__ = "2.5.0"
+__version__ = "2.6.0"
 
 
 def _pre_warm_engine_in_background(ctx):
@@ -61,7 +61,7 @@ def _pre_warm_engine_in_background(ctx):
                 _write_audit_log(
                     "[PRE-WARM] Ollama unavailable; keyword fallback remains active."
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - pre-warm must never block plugin registration
             logger.warning(
                 "[Smart-Filter] Background pre-warm error (%s).", type(exc).__name__
             )
@@ -94,7 +94,7 @@ def _patch_native_bridge(handler):
             try:
                 # Pass current_tool_defs so the plugin can search the full deferred catalog.
                 return handler(args=args, tools=current_tool_defs)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - preserve Hermes BM25 as the fallback
                 logger.error(
                     "[Smart-Filter] Dispatch failed, falling back to Hermes BM25: %s",
                     exc,
@@ -120,7 +120,7 @@ def _patch_native_bridge(handler):
             "[PLUGIN LOADED] Native tools.tool_search.dispatch_tool_search patched with Ollama semantic search."
         )
         logger.info("[Smart-Filter] Native tool_search monkey-patched successfully.")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - plugin patching is an optional compatibility layer
         _write_audit_log(
             f"[PLUGIN LOADED] Failed to monkey-patch tools.tool_search: {exc}"
         )
@@ -147,7 +147,7 @@ def register(ctx):
         ctx.register_hook("pre_llm_call", pre_llm_callback)
         _write_audit_log("[PLUGIN LOADED] Registered 'pre_llm_call' hook.")
         logger.info("[Smart-Filter] Registered 'pre_llm_call' hook.")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - hook registration must not prevent fallback tool registration
         _write_audit_log(f"[PLUGIN LOADED] Failed to register 'pre_llm_call': {exc}")
         logger.warning("[Smart-Filter] Failed to register 'pre_llm_call' hook: %s", exc)
 
@@ -161,7 +161,7 @@ def register(ctx):
             handler=handler,
             override=True,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - use the standalone tool when override registration fails
         _write_audit_log(
             f"[PLUGIN LOADED] Fallback to semantic_tool_search due to: {exc}"
         )
