@@ -15,7 +15,7 @@ except (ImportError, ValueError):
 
 logger = logging.getLogger("hermes.plugins.mcp_smart_filter")
 
-__version__ = "2.6.0"
+__version__ = "2.6.1"
 
 
 def _pre_warm_engine_in_background(ctx):
@@ -89,30 +89,48 @@ def _patch_native_bridge(handler):
         orig_dispatch = ts.dispatch_tool_search
 
         def smart_filter_dispatch(
-            args, *, current_tool_defs, config=None, connector_search=None
+            args,
+            *,
+            current_tool_defs,
+            config=None,
+            connector_search=None,
+            call=None,
+            **kwargs,
         ):
             try:
-                # Pass current_tool_defs so the plugin can search the full deferred catalog.
-                return handler(args=args, tools=current_tool_defs)
+                # Core passes ``call`` for scoped connector/tool-search accounting.
+                # Keep the complete dispatcher context even if this handler only needs
+                # the current tool definitions today.
+                return handler(
+                    args=args,
+                    tools=current_tool_defs,
+                    config=config,
+                    connector_search=connector_search,
+                    call=call,
+                    _scope_tool_defs=True,
+                    **kwargs,
+                )
             except Exception as exc:  # noqa: BLE001 - preserve Hermes BM25 as the fallback
                 logger.error(
                     "[Smart-Filter] Dispatch failed, falling back to Hermes BM25: %s",
                     exc,
                 )
-                # Hermes >= v0.21.4 added a ``connector_search`` keyword to
-                # tools.tool_search.dispatch_tool_search. Forward it when the
-                # native dispatcher accepts it; older 0.20.x signatures lack it.
+                native_kwargs = {
+                    "current_tool_defs": current_tool_defs,
+                    "config": config,
+                    "connector_search": connector_search,
+                    "call": call,
+                    **kwargs,
+                }
                 try:
-                    return orig_dispatch(
-                        args,
-                        current_tool_defs=current_tool_defs,
-                        config=config,
-                        connector_search=connector_search,
-                    )
+                    return orig_dispatch(args, **native_kwargs)
                 except TypeError:
-                    return orig_dispatch(
-                        args, current_tool_defs=current_tool_defs, config=config
-                    )
+                    native_kwargs.pop("call", None)
+                    try:
+                        return orig_dispatch(args, **native_kwargs)
+                    except TypeError:
+                        native_kwargs.pop("connector_search", None)
+                        return orig_dispatch(args, **native_kwargs)
 
         ts.dispatch_tool_search = smart_filter_dispatch
         ts._smart_filter_patched = True

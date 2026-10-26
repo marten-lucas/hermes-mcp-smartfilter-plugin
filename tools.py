@@ -11,6 +11,7 @@ import re
 import threading
 import time
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -72,6 +73,7 @@ def _extract_tool_info(tool: Any) -> dict[str, Any]:
     name = ""
     description = ""
     param_names: list[str] = []
+    required_params: list[str] = []
 
     if isinstance(tool, dict):
         function = tool.get("function")
@@ -89,6 +91,9 @@ def _extract_tool_info(tool: Any) -> dict[str, Any]:
             properties = params.get("properties")
             if isinstance(properties, dict):
                 param_names = list(properties.keys())
+            required = params.get("required")
+            if isinstance(required, list):
+                required_params = [str(name) for name in required if isinstance(name, str)]
     else:
         # Support tool objects with attributes
         name = str(getattr(tool, "name", "")).strip()
@@ -98,6 +103,9 @@ def _extract_tool_info(tool: Any) -> dict[str, Any]:
             props = schema.get("properties") or {}
             if isinstance(props, dict):
                 param_names = list(props.keys())
+            required = schema.get("required")
+            if isinstance(required, list):
+                required_params = [str(name) for name in required if isinstance(name, str)]
 
     # Build rich searchable representation
     search_parts = [name]
@@ -112,6 +120,7 @@ def _extract_tool_info(tool: Any) -> dict[str, Any]:
         "name": name,
         "description": description,
         "parameters": param_names,
+        "required": required_params,
         "search_text": search_text,
     }
 
@@ -121,6 +130,12 @@ def _get_available_tools(ctx: Any, kwargs: dict[str, Any]) -> list[Any]:
     Defensively obtain the current Hermes tool catalogue from arguments,
     context manager, PluginContext, or the local MCP schema cache.
     """
+    if kwargs.get("_scope_tool_defs"):
+        tools = kwargs.get("tools")
+        if isinstance(tools, dict):
+            return list(tools.values())
+        return list(tools or [])
+
     tools = kwargs.get("tools") or kwargs.get("available_tools")
     if tools:
         return list(tools)
@@ -879,15 +894,93 @@ def create_handler(ctx: Any):
         if len(queries) > 10:
             queries = queries[:10]
 
-        # 2. Parse limit parameter
+        # 2. Honor the native bridge's validated limits when it supplied them.
+        scoped_call = bool(kwargs.get("_scope_tool_defs"))
+        core_config = kwargs.get("config")
+        if scoped_call and core_config is None:
+            try:
+                from tools.tool_search import load_config as load_core_config
+
+                core_config = load_core_config()
+            except (ImportError, AttributeError):
+                core_config = None
+
+        def core_setting(name: str, fallback: int) -> int:
+            value = (
+                core_config.get(name, fallback)
+                if isinstance(core_config, dict)
+                else getattr(core_config, name, fallback)
+            )
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return fallback
+
+        maximum = min(50, default_max_k, core_setting("max_search_limit", 50))
+        default_limit = min(
+            maximum,
+            core_setting("search_default_limit", default_max_k),
+        )
+        minimum = min(default_min_k, maximum)
         requested_limit = args.get("limit")
         if isinstance(requested_limit, int) and requested_limit > 0:
-            limit = min(max(default_min_k, requested_limit), 50)
+            limit = min(max(minimum, requested_limit), maximum)
         else:
-            limit = default_max_k
+            limit = max(minimum, default_limit)
 
-        # 3. Retrieve available tool catalogue
+        # 3. Read the current session's actual tool definitions when called by
+        # Hermes' native deferred-tool bridge. Never widen that scope from a
+        # process-wide registry or stale schema cache.
+        session_tool_defs = kwargs.get("tools") or []
+        if isinstance(session_tool_defs, dict):
+            session_tool_defs = list(session_tool_defs.values())
         raw_tools = _get_available_tools(ctx, kwargs)
+        if scoped_call:
+            try:
+                from tools.tool_search import _deferrable_in
+
+                raw_tools = _deferrable_in(raw_tools)
+            except (ImportError, AttributeError) as exc:
+                logger.warning(
+                    "[Smart-Filter] Core deferred-tool scope unavailable; refusing to search unscoped tools (%s).",
+                    type(exc).__name__,
+                )
+                raw_tools = []
+
+        connector_entries: list[list[Any]] = [[] for _ in queries]
+        connector_failure = None
+        connectors_unavailable = None
+        if scoped_call:
+            try:
+                from tools.connectors.search import (
+                    connections_in_scope,
+                    connector_entries_by_group,
+                )
+                from tools.connectors.search import (
+                    connectors_unavailable as format_connectors_unavailable,
+                )
+
+                if connections_in_scope(session_tool_defs):
+                    connector_search = kwargs.get("connector_search")
+                    call = kwargs.get("call")
+                    if connector_search is None:
+                        from tools.connectors.gateway.bridge import (
+                            connector_search_hits,
+                        )
+
+                        connector_search = partial(connector_search_hits, call=call)
+                    connector_entries, connector_failure = connector_entries_by_group(
+                        queries,
+                        connector_search=connector_search,
+                        call=call,
+                    )
+                    connectors_unavailable = format_connectors_unavailable
+            except (ImportError, AttributeError) as exc:
+                logger.debug(
+                    "[Smart-Filter] Native connector search unavailable (%s).",
+                    type(exc).__name__,
+                )
+
         extracted_tools: list[dict[str, Any]] = []
 
         for item in raw_tools:
@@ -906,7 +999,8 @@ def create_handler(ctx: Any):
         tools_map: dict[str, dict[str, Any]] = {}
 
         # 4. Search each query
-        for q in queries:
+        connector_names: set[str] = set()
+        for query_index, q in enumerate(queries):
             matched_tuples = _ENGINE.search(
                 query=q,
                 tools=extracted_tools,
@@ -928,12 +1022,33 @@ def create_handler(ctx: Any):
                         "description": tool_info["description"][:400],
                         "required": [
                             p
-                            for p in tool_info.get("parameters", [])
+                            for p in tool_info.get("required", [])
                             if isinstance(p, str)
                         ][:32],
                         "score": round(score, 3),
                         "search_method": method,
                     }
+
+            for entry in connector_entries[query_index]:
+                name = str(getattr(entry, "name", "") or "")
+                if not name:
+                    continue
+                if name not in matched_names:
+                    matched_names.append(name)
+                connector_names.add(name)
+                if name not in tools_map:
+                    try:
+                        from tools.tool_search import _shared_tool_record
+
+                        tools_map[name] = _shared_tool_record(entry)
+                    except (ImportError, AttributeError):
+                        tools_map[name] = {
+                            "source": "connectors",
+                            "source_name": str(getattr(entry, "source_name", "") or ""),
+                            "description": str(getattr(entry, "description", "") or "")[:500],
+                            "required": [],
+                        }
+                used_method = f"{used_method}+connectors"
 
             if debug_mode:
                 import sys
@@ -955,17 +1070,37 @@ def create_handler(ctx: Any):
         _write_audit_log(
             f"[TOOL_SEARCH OVERRIDE EXECUTED] queries={queries!r} (limit={limit}, available={len(extracted_tools)}) -> engines={engines}, matches={list(tools_map.keys())}"
         )
+        response = {
+            "queries": queries,
+            "total_available": len(extracted_tools) + len(connector_names),
+            "search_engine": f"ollama ({_ENGINE.model_name})",
+            "results": results,
+            "tools": tools_map,
+        }
+        if connector_failure and connectors_unavailable is not None:
+            response["connectors"] = connectors_unavailable(
+                connector_failure,
+                verb="searched",
+            )
+        if scoped_call:
+            try:
+                from tools.tool_search import _record_search_metric
 
-        return json.dumps(
-            {
-                "queries": queries,
-                "total_available": len(extracted_tools),
-                "search_engine": f"ollama ({_ENGINE.model_name})",
-                "results": results,
-                "tools": tools_map,
-            },
-            ensure_ascii=False,
-        )
+                outcome = (
+                    "connector_unavailable"
+                    if connector_failure
+                    else "hits"
+                    if tools_map
+                    else "no_hits"
+                )
+                _record_search_metric(
+                    session_tool_defs,
+                    hits=len(tools_map),
+                    outcome=outcome,
+                )
+            except (ImportError, AttributeError):
+                pass
+        return json.dumps(response, ensure_ascii=False)
 
     return handle_tool_search
 

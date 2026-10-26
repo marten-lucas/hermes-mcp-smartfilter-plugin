@@ -4,7 +4,7 @@ import json
 import os
 import sys
 import unittest
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
@@ -69,6 +69,7 @@ class TestToolExtraction(unittest.TestCase):
                         "title": {"type": "string"},
                         "body": {"type": "string"},
                     },
+                    "required": ["repo", "title"],
                 },
             },
         }
@@ -79,6 +80,7 @@ class TestToolExtraction(unittest.TestCase):
         )
         self.assertIn("repo", info["parameters"])
         self.assertIn("title", info["parameters"])
+        self.assertEqual(info["required"], ["repo", "title"])
         self.assertIn("github_create_issue", info["search_text"])
         self.assertIn("parameters: repo, title, body", info["search_text"])
 
@@ -470,6 +472,239 @@ class TestHandlerExecution(unittest.TestCase):
         self.assertEqual(response["total_available"], 1001)
         self.assertEqual(len(response["results"]), 1)
         self.assertIn("kubernetes_deploy_helm_chart", response["results"][0]["matches"])
+
+    @staticmethod
+    def _core_scope_modules(deferrable, *, connections=False, remote_entries=None):
+        tools_package = ModuleType("tools")
+        tools_package.__path__ = []
+        core_search = ModuleType("tools.tool_search")
+        core_search._deferrable_in = deferrable
+        core_search._record_search_metric = MagicMock()
+        core_search.load_config = lambda: SimpleNamespace(
+            search_default_limit=5,
+            max_search_limit=25,
+        )
+        core_search._shared_tool_record = lambda entry: {
+            "source": entry.source,
+            "source_name": entry.source_name,
+            "description": entry.description,
+            "required": ["query"],
+        }
+        tools_package.tool_search = core_search
+
+        connectors_package = ModuleType("tools.connectors")
+        connectors_package.__path__ = []
+        connectors_search = ModuleType("tools.connectors.search")
+        connectors_search.connections_in_scope = lambda _defs: connections
+        connectors_search.connector_entries_by_group = (
+            lambda queries, connector_search=None, call=None: (
+                remote_entries or [[] for _ in queries],
+                None,
+            )
+        )
+        connectors_search.connectors_unavailable = lambda *args, **kwargs: {}
+        connectors_package.search = connectors_search
+        tools_package.connectors = connectors_package
+        return {
+            "tools": tools_package,
+            "tools.tool_search": core_search,
+            "tools.connectors": connectors_package,
+            "tools.connectors.search": connectors_search,
+        }
+
+    def test_native_scope_search_excludes_non_deferred_tools(self):
+        ctx = MagicMock()
+        ctx.get_tools.return_value = [
+            {"name": "mcp__cache__unregistered_tool", "description": "stale cache entry"}
+        ]
+        definitions = [
+            {"type": "function", "function": {"name": "terminal", "description": "Search vaultwarden logins"}},
+            {"type": "function", "function": {"name": "mcp__agentgateway_infra__vaultwarden_search", "description": "Search Vaultwarden login entries", "parameters": {"properties": {"query": {}}}}},
+        ]
+        modules = self._core_scope_modules(
+            lambda defs: [
+                item for item in defs
+                if item["function"]["name"].startswith("mcp__")
+            ]
+        )
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(plugin_tools, "_ENGINE", self._keyword_engine()),
+        ):
+            response = json.loads(
+                create_handler(ctx)(
+                    args={"queries": ["vaultwarden login"]},
+                    tools=definitions,
+                    _scope_tool_defs=True,
+                )
+            )
+
+        self.assertEqual(response["total_available"], 1)
+        self.assertEqual(
+            response["results"][0]["matches"],
+            ["mcp__agentgateway_infra__vaultwarden_search"],
+        )
+        self.assertNotIn("terminal", response["tools"])
+        self.assertNotIn("mcp__cache__unregistered_tool", response["tools"])
+
+    def test_native_scope_honors_core_result_limit(self):
+        ctx = MagicMock()
+        definitions = [
+            {
+                "type": "function",
+                "function": {
+                    "name": f"mcp__agentgateway__vaultwarden_search_{index}",
+                    "description": "Search Vaultwarden login entries",
+                },
+            }
+            for index in range(4)
+        ]
+        modules = self._core_scope_modules(lambda defs: defs)
+        config = SimpleNamespace(search_default_limit=2, max_search_limit=3)
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(plugin_tools, "_ENGINE", self._keyword_engine()),
+        ):
+            response = json.loads(
+                create_handler(ctx)(
+                    args={"queries": ["vaultwarden login"], "limit": 10},
+                    tools=definitions,
+                    config=config,
+                    _scope_tool_defs=True,
+                )
+            )
+
+        self.assertEqual(response["total_available"], 4)
+        self.assertEqual(len(response["results"][0]["matches"]), 3)
+
+    def test_native_scope_search_merges_hosted_connectors_with_call_context(self):
+        ctx = MagicMock()
+        call_ref = object()
+        connector_search = object()
+        definitions = [
+            {"type": "function", "function": {"name": "manage_connections", "description": "Manage connectors"}},
+            {"type": "function", "function": {"name": "mcp__agentgateway_infra__vaultwarden_search", "description": "Search Vaultwarden login entries", "parameters": {"properties": {"query": {}}}}},
+        ]
+        remote_entry = type(
+            "CatalogEntry",
+            (),
+            {
+                "name": "connector__gmail__search_messages",
+                "description": "Search Gmail messages",
+                "source": "connectors",
+                "source_name": "gmail",
+                "schema": {"function": {"parameters": {"required": ["query"]}}},
+            },
+        )()
+        connector_calls = []
+
+        def connector_entries(queries, *, connector_search=None, call=None):
+            connector_calls.append((queries, connector_search, call))
+            return [[remote_entry] for _ in queries], None
+
+        modules = self._core_scope_modules(
+            lambda defs: [item for item in defs if item["function"]["name"].startswith("mcp__")],
+            connections=True,
+        )
+        modules["tools.connectors.search"].connector_entries_by_group = connector_entries
+        with patch.dict(sys.modules, modules), patch.object(
+            plugin_tools, "_ENGINE", self._keyword_engine()
+        ):
+            response = json.loads(
+                create_handler(ctx)(
+                    args={"queries": ["vaultwarden login"]},
+                    tools=definitions,
+                    connector_search=connector_search,
+                    call=call_ref,
+                    _scope_tool_defs=True,
+                )
+            )
+
+        self.assertEqual(len(connector_calls), 1)
+        self.assertIs(connector_calls[0][1], connector_search)
+        self.assertIs(connector_calls[0][2], call_ref)
+        self.assertIn("connector__gmail__search_messages", response["tools"])
+        self.assertIn(
+            "connector__gmail__search_messages",
+            response["results"][0]["matches"],
+        )
+
+
+class TestNativeBridgeCallCompatibility(unittest.TestCase):
+    @staticmethod
+    def _fake_tools_modules(native_dispatch):
+        package = ModuleType("tools")
+        package.__path__ = []
+        module = ModuleType("tools.tool_search")
+        module.dispatch_tool_search = native_dispatch
+        module._smart_filter_patched = False
+        package.tool_search = module
+        return package, module
+
+    def test_core_call_reference_reaches_semantic_handler(self):
+        package, module = self._fake_tools_modules(lambda *_args, **_kwargs: "native")
+        handler_calls = []
+        call_ref = object()
+        connector_search = object()
+        tool_defs = [{"function": {"name": "mcp__gateway__list_tools"}}]
+
+        def handler(**kwargs):
+            handler_calls.append(kwargs)
+            return "semantic"
+
+        with (
+            patch.dict(sys.modules, {"tools": package, "tools.tool_search": module}),
+            patch.object(plugin_init, "_write_audit_log"),
+        ):
+            plugin_init._patch_native_bridge(handler)
+            result = module.dispatch_tool_search(
+                {"queries": ["list tools"]},
+                current_tool_defs=tool_defs,
+                connector_search=connector_search,
+                call=call_ref,
+            )
+
+        self.assertEqual(result, "semantic")
+        self.assertEqual(len(handler_calls), 1)
+        self.assertIs(handler_calls[0]["call"], call_ref)
+        self.assertIs(handler_calls[0]["connector_search"], connector_search)
+        self.assertIs(handler_calls[0]["tools"], tool_defs)
+
+    def test_legacy_native_dispatcher_fallback_drops_unsupported_call_kwarg(self):
+        native_calls = []
+
+        def legacy_dispatch(
+            args,
+            *,
+            current_tool_defs,
+            config=None,
+            connector_search=None,
+        ):
+            native_calls.append((args, current_tool_defs, connector_search))
+            return "native-fallback"
+
+        package, module = self._fake_tools_modules(legacy_dispatch)
+
+        def failing_handler(**_kwargs):
+            raise RuntimeError("semantic search failed")
+
+        call_ref = object()
+        connector_search = object()
+        tool_defs = [{"function": {"name": "mcp__gateway__list_tools"}}]
+        with (
+            patch.dict(sys.modules, {"tools": package, "tools.tool_search": module}),
+            patch.object(plugin_init, "_write_audit_log"),
+        ):
+            plugin_init._patch_native_bridge(failing_handler)
+            result = module.dispatch_tool_search(
+                {"queries": ["list tools"]},
+                current_tool_defs=tool_defs,
+                connector_search=connector_search,
+                call=call_ref,
+            )
+
+        self.assertEqual(result, "native-fallback")
+        self.assertEqual(native_calls, [({"queries": ["list tools"]}, tool_defs, connector_search)])
 
 
 class TestPluginRegistration(unittest.TestCase):
