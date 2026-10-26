@@ -576,6 +576,7 @@ class OllamaSearchEngine:
         )
         self.batch_size = self._positive_int("SMART_FILTER_OLLAMA_BATCH_SIZE", 64)
         self.threads = self._positive_int("SMART_FILTER_THREADS", 1)
+        self.gpu_layers = self._gpu_layer_count("SMART_FILTER_NUM_GPU", -1)
         self.timeout = self._positive_float("SMART_FILTER_OLLAMA_TIMEOUT", 30.0)
         self.keep_alive = os.environ.get("SMART_FILTER_OLLAMA_KEEP_ALIVE", "5m").strip()
         self._connection_resolver = connection_resolver or _resolve_ollama_connection
@@ -584,6 +585,8 @@ class OllamaSearchEngine:
         self._retry_after = 0.0
         self._cache_lock = threading.Lock()
         self._build_lock = threading.Lock()
+        self._refresh_lock = threading.Lock()
+        self._refreshing_fingerprints: set[str] = set()
         self._cache: (
             tuple[str, list[dict[str, Any]], list[tuple[float, ...]]] | None
         ) = None
@@ -607,6 +610,14 @@ class OllamaSearchEngine:
     def _positive_float(name: str, default: float) -> float:
         try:
             return max(0.1, float(os.environ.get(name, str(default))))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _gpu_layer_count(name: str, default: int) -> int:
+        try:
+            value = int(os.environ.get(name, str(default)))
+            return value if value >= -1 else default
         except (TypeError, ValueError):
             return default
 
@@ -654,7 +665,10 @@ class OllamaSearchEngine:
             raise RuntimeError("Ollama embedding provider is unavailable")
 
         endpoint, headers = self._connection
-        payload_options = {"num_gpu": 0, "num_thread": self.threads}
+        payload_options = {
+            "num_gpu": self.gpu_layers,
+            "num_thread": self.threads,
+        }
         vectors: list[tuple[float, ...]] = []
         with self._client() as client:
             for start in range(0, len(texts), self.batch_size):
@@ -700,8 +714,14 @@ class OllamaSearchEngine:
             hasher.update(b"\x01")
         return hasher.hexdigest()
 
-    def _sync_tool_catalog(self, tools: list[dict[str, Any]]) -> bool:
-        """Embed and cache a tool catalog once per model and catalog fingerprint."""
+    def _sync_tool_catalog(
+        self, tools: list[dict[str, Any]], *, build_if_missing: bool = True
+    ) -> bool:
+        """Embed and cache a tool catalog once per model and catalog fingerprint.
+
+        ``build_if_missing=False`` is the latency-sensitive search path: it only
+        checks the cache and never waits for a background pre-warm to finish.
+        """
         if not tools:
             with self._cache_lock:
                 self._cache = None
@@ -713,6 +733,9 @@ class OllamaSearchEngine:
         with self._cache_lock:
             if self._cache is not None and self._cache[0] == fingerprint:
                 return True
+
+        if not build_if_missing:
+            return False
 
         with self._build_lock:
             with self._cache_lock:
@@ -742,6 +765,35 @@ class OllamaSearchEngine:
                 self._record_failure(exc)
                 return False
 
+    def _schedule_catalog_refresh(self, tools: list[dict[str, Any]]) -> None:
+        """Refresh a changed/missing catalog off the tool-call path."""
+        if not tools:
+            return
+        fingerprint = f"{self.model_name}:{self._compute_fingerprint(tools)}"
+        with self._cache_lock:
+            if self._cache is not None and self._cache[0] == fingerprint:
+                return
+        with self._refresh_lock:
+            if fingerprint in self._refreshing_fingerprints:
+                return
+            self._refreshing_fingerprints.add(fingerprint)
+
+        def refresh() -> None:
+            try:
+                self._sync_tool_catalog(tools)
+            finally:
+                with self._refresh_lock:
+                    self._refreshing_fingerprints.discard(fingerprint)
+
+        try:
+            threading.Thread(
+                target=refresh, daemon=True, name="smart-filter-catalog-refresh"
+            ).start()
+        except RuntimeError:
+            with self._refresh_lock:
+                self._refreshing_fingerprints.discard(fingerprint)
+            logger.warning("[Smart-Filter] Could not schedule catalog refresh.")
+
     def search(
         self,
         query: str,
@@ -752,7 +804,8 @@ class OllamaSearchEngine:
         query_text = query.strip()
         if not query_text:
             return []
-        if not self._sync_tool_catalog(tools):
+        if not self._sync_tool_catalog(tools, build_if_missing=False):
+            self._schedule_catalog_refresh(tools)
             return self._keyword_search(query_text, tools, limit=limit)
 
         try:

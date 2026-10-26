@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import threading
 import unittest
 from types import ModuleType, SimpleNamespace
 from typing import ClassVar
@@ -180,6 +181,7 @@ class TestOllamaSearchEngine(unittest.TestCase):
     def test_semantic_search_batches_catalog_and_caches_vectors(self):
         engine = self._engine()
         engine.batch_size = 2
+        self.assertTrue(engine._sync_tool_catalog(self.sample_tools))
 
         # The query intentionally shares no keywords with the GitHub tool.
         results = engine.search(
@@ -195,7 +197,7 @@ class TestOllamaSearchEngine(unittest.TestCase):
         self.assertEqual(first_request["url"], "https://ollama.example/api/embed")
         self.assertEqual(first_request["headers"]["Authorization"], "Bearer test-only")
         self.assertEqual(first_request["json"]["model"], "qwen3-embedding:test")
-        self.assertEqual(first_request["json"]["options"]["num_gpu"], 0)
+        self.assertEqual(first_request["json"]["options"]["num_gpu"], -1)
         self.assertEqual(first_request["json"]["options"]["num_thread"], 1)
 
         engine.search(
@@ -237,6 +239,7 @@ class TestOllamaSearchEngine(unittest.TestCase):
                 FakeOllamaClient.requests, encoder, timeout
             ),
         )
+        self.assertTrue(engine._sync_tool_catalog(large_tools))
         results = engine.search("deploy the chart", large_tools, limit=5)
 
         self.assertEqual(results[0][0]["name"], "kubernetes_deploy_helm_chart")
@@ -250,6 +253,14 @@ class TestOllamaSearchEngine(unittest.TestCase):
                 for request in FakeOllamaClient.requests
             )
         )
+
+    def test_gpu_layer_setting_defaults_to_auto_and_can_be_overridden(self):
+        auto_gpu = self._engine()
+        self.assertEqual(auto_gpu.gpu_layers, -1)
+
+        with patch.dict(os.environ, {"SMART_FILTER_NUM_GPU": "0"}, clear=True):
+            cpu_only = OllamaSearchEngine()
+        self.assertEqual(cpu_only.gpu_layers, 0)
 
     def test_reuses_hermes_custom_ollama_provider_and_secret(self):
         hermes_cli = ModuleType("hermes_cli")
@@ -315,6 +326,32 @@ class TestOllamaSearchEngine(unittest.TestCase):
             "https://ollama.example",
         )
 
+    def test_search_uses_keyword_fallback_without_waiting_for_catalog_build(self):
+        engine = self._engine()
+        engine._build_lock.acquire()
+        finished = threading.Event()
+        result = {}
+
+        def search_while_pre_warming():
+            with patch.object(engine, "_schedule_catalog_refresh") as schedule:
+                result["matches"] = engine.search("github issue", self.sample_tools)
+                result["schedule_called"] = schedule.called
+                finished.set()
+
+        worker = threading.Thread(target=search_while_pre_warming, daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(finished.wait(timeout=1.0))
+        finally:
+            engine._build_lock.release()
+            worker.join(timeout=1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(result["schedule_called"])
+        self.assertEqual(result["matches"][0][0]["name"], "github_search_issues")
+        self.assertEqual(result["matches"][0][2], "keyword_fallback")
+        self.assertEqual(FakeOllamaClient.requests, [])
+
     def test_endpoint_failure_uses_keyword_fallback(self):
         class FailingClient:
             def __init__(self, timeout):
@@ -333,7 +370,9 @@ class TestOllamaSearchEngine(unittest.TestCase):
             connection_resolver=lambda: ("http://ollama.example/api/embed", {}),
             client_factory=FailingClient,
         )
-        results = engine.search("github issue", self.sample_tools, limit=2)
+        self.assertFalse(engine._sync_tool_catalog(self.sample_tools))
+        with patch.object(engine, "_schedule_catalog_refresh"):
+            results = engine.search("github issue", self.sample_tools, limit=2)
         self.assertEqual(results[0][0]["name"], "github_search_issues")
         self.assertEqual(results[0][2], "keyword_fallback")
 

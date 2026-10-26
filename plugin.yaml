@@ -44,6 +44,10 @@ optional_env:
     description: "CPU threads for embedding requests (default: 1)"
     prompt: "Embedding CPU threads"
     password: false
+  - name: SMART_FILTER_NUM_GPU
+    description: "Ollama GPU layers for embeddings: -1 auto (default), 0 CPU-only"
+    prompt: "Embedding GPU layer offload"
+    password: false
   - name: SMART_FILTER_OLLAMA_BATCH_SIZE
     description: "Number of tool descriptions embedded per Ollama request (default: 64)"
     prompt: "Ollama embedding batch size"

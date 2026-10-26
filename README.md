@@ -2,7 +2,7 @@
 
 Semantic MCP-tool discovery for Hermes Agent. The plugin overrides Hermes' native BM25 `tool_search`, embeds the current tool catalog and each query through the **Ollama provider already configured in Hermes**, and ranks the cached vectors locally. It keeps keyword matching as a fallback when Ollama cannot be reached.
 
-The default embedding model is `qwen3-embedding:latest`; this is separate from Hermes' chat model. The plugin sends batches to Ollama's native `POST /api/embed` endpoint, requests CPU execution (`num_gpu: 0`) and defaults to one CPU thread. It does not require FastEmbed, ONNX Runtime, NumPy, or a separate embedding service.
+The default embedding model is `qwen3-embedding:latest`; this is separate from Hermes' chat model. The plugin sends batches to Ollama's native `POST /api/embed` endpoint and defaults to Ollama's automatic GPU offload (`num_gpu: -1`), with one CPU thread available for preprocessing. Set `SMART_FILTER_NUM_GPU=0` to force CPU-only embeddings. It does not require FastEmbed, ONNX Runtime, NumPy, or a separate embedding service.
 
 ## Why override `tool_search`?
 
@@ -54,6 +54,7 @@ The old FastEmbed variable `SMART_FILTER_MODEL` is not used by the Ollama backen
 | --- | --- | --- |
 | `SMART_FILTER_OLLAMA_MODEL` | `qwen3-embedding:latest` | Ollama embedding model; use an embedding model, not the chat model |
 | `SMART_FILTER_THREADS` | `1` | CPU threads sent to Ollama with each embedding request |
+| `SMART_FILTER_NUM_GPU` | `-1` | Ollama GPU layers (`-1` = automatic offload, `0` = CPU-only) |
 | `SMART_FILTER_OLLAMA_BATCH_SIZE` | `64` | Number of tool descriptions embedded per request |
 | `SMART_FILTER_OLLAMA_TIMEOUT` | `30` | HTTP timeout in seconds |
 | `SMART_FILTER_OLLAMA_KEEP_ALIVE` | `5m` | Ollama model keep-alive after embedding |
@@ -65,7 +66,7 @@ The old FastEmbed variable `SMART_FILTER_MODEL` is not used by the Ollama backen
 | `SMART_FILTER_PRE_LLM_MAX_TOOLS` | `4` | Maximum tools injected by the pre-LLM hook |
 | `SMART_FILTER_LIVE_RBAC_DISCOVERY` | `false` | Query Agentgateway live with the caller's identity headers |
 
-Ollama's native `/api/embed` request accepts `options.num_gpu` and `options.num_thread`; the plugin requests `num_gpu: 0` and uses `SMART_FILTER_THREADS`. This is per embedding request and does not change GPU settings for Hermes chat inference. The first catalog indexing can take longer; subsequent searches reuse its in-memory vectors until the model or tool catalog changes.
+Ollama's native `/api/embed` request accepts `options.num_gpu` and `options.num_thread`; the plugin uses `SMART_FILTER_NUM_GPU` and `SMART_FILTER_THREADS` per embedding request. This affects only embedding inference, not Hermes chat inference. The first catalog indexing can take longer; while it runs, searches use the keyword fallback rather than waiting synchronously. Subsequent searches reuse the in-memory vectors until the model or tool catalog changes.
 
 The embedding request sends tool names/descriptions and search queries to the configured Ollama endpoint. Whether that traffic stays on the local network depends on the URL and reverse-proxy routing configured for that provider.
 
@@ -74,7 +75,7 @@ The embedding request sends tool names/descriptions and search queries to the co
 1. The plugin obtains the current tool catalog from Hermes, the PluginContext, or the MCP schema cache.
 2. Tool descriptions are embedded in batches and cached by model plus catalog fingerprint.
 3. Each search query is embedded with the same model; normalized dot products rank the candidates.
-4. If configuration, connectivity, model lookup, or embedding fails, the plugin uses its keyword fallback and logs the failure type/HTTP status without logging credentials.
+4. If configuration, connectivity, model lookup, or embedding fails, or a catalog fingerprint is still being indexed in the background, the plugin immediately uses its keyword fallback instead of blocking the tool-search call. It logs failure type/HTTP status without logging credentials.
 
 The `pre_llm_call` hook uses the same engine to surface a few likely MCP tools before generation. Live RBAC discovery remains optional and continues to use `X-User-Groups` when enabled.
 
